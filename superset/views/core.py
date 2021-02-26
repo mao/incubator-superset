@@ -1,784 +1,198 @@
-# -*- coding: utf-8 -*-
-# pylint: disable=C,R,W
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
-from datetime import datetime, timedelta
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=comparison-with-callable, line-too-long, too-many-branches
 import logging
-import os
 import re
-import time
-import traceback
+from contextlib import closing
+from datetime import datetime, timedelta
+from typing import Any, Callable, cast, Dict, List, Optional, Union
 from urllib import parse
 
-from flask import (
-    flash, g, Markup, redirect, render_template, request, Response, url_for,
-)
-from flask_appbuilder import expose, SimpleFormView
-from flask_appbuilder.actions import action
-from flask_appbuilder.models.sqla.interface import SQLAInterface
-from flask_appbuilder.security.decorators import has_access, has_access_api
-from flask_babel import gettext as __
-from flask_babel import lazy_gettext as _
+import backoff
+import humanize
 import pandas as pd
 import simplejson as json
-from six import text_type
-import sqlalchemy as sqla
-from sqlalchemy import and_, create_engine, or_, update
+from flask import abort, flash, g, Markup, redirect, render_template, request, Response
+from flask_appbuilder import expose
+from flask_appbuilder.models.sqla.interface import SQLAInterface
+from flask_appbuilder.security.decorators import (
+    has_access,
+    has_access_api,
+    permission_name,
+)
+from flask_appbuilder.security.sqla import models as ab_models
+from flask_babel import gettext as __, lazy_gettext as _, ngettext
+from jinja2.exceptions import TemplateError
+from jinja2.meta import find_undeclared_variables
+from sqlalchemy import and_, or_
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import IntegrityError
-from unidecode import unidecode
-from werkzeug.routing import BaseConverter
-from werkzeug.utils import secure_filename
+from sqlalchemy.exc import ArgumentError, DBAPIError, NoSuchModuleError, SQLAlchemyError
+from sqlalchemy.orm.session import Session
+from sqlalchemy.sql import functions as func
+from werkzeug.urls import Href
 
 from superset import (
-    app, appbuilder, cache, db, results_backend, security_manager, sql_lab, utils,
+    app,
+    appbuilder,
+    conf,
+    db,
+    event_logger,
+    get_feature_flags,
+    is_feature_enabled,
+    results_backend,
+    results_backend_use_msgpack,
+    security_manager,
+    sql_lab,
     viz,
 )
+from superset.charts.dao import ChartDAO
+from superset.connectors.base.models import BaseDatasource
 from superset.connectors.connector_registry import ConnectorRegistry
-from superset.connectors.sqla.models import AnnotationDatasource, SqlaTable
-from superset.exceptions import SupersetException, SupersetSecurityException
-from superset.forms import CsvToDatabaseForm
+from superset.connectors.sqla.models import (
+    AnnotationDatasource,
+    SqlaTable,
+    SqlMetric,
+    TableColumn,
+)
+from superset.dashboards.commands.importers.v0 import ImportDashboardsCommand
+from superset.dashboards.dao import DashboardDAO
+from superset.databases.dao import DatabaseDAO
+from superset.databases.filters import DatabaseFilter
+from superset.datasets.commands.exceptions import DatasetNotFoundError
+from superset.exceptions import (
+    CacheLoadError,
+    CertificateException,
+    DatabaseNotFound,
+    SerializationError,
+    SupersetException,
+    SupersetGenericDBErrorException,
+    SupersetSecurityException,
+    SupersetTemplateParamsErrorException,
+    SupersetTimeoutException,
+)
+from superset.extensions import async_query_manager, cache_manager
 from superset.jinja_context import get_template_processor
-from superset.legacy import cast_form_data
-import superset.models.core as models
-from superset.models.sql_lab import Query
-from superset.sql_parse import SupersetQuery
-from superset.utils import (
-    merge_extra_filters, merge_request_params, QueryStatus,
+from superset.models.core import Database, FavStar, Log
+from superset.models.dashboard import Dashboard
+from superset.models.datasource_access_request import DatasourceAccessRequest
+from superset.models.slice import Slice
+from superset.models.sql_lab import Query, TabState
+from superset.models.user_attributes import UserAttribute
+from superset.queries.dao import QueryDAO
+from superset.security.analytics_db_safety import check_sqlalchemy_uri
+from superset.sql_parse import CtasMethod, ParsedQuery, Table
+from superset.sql_validators import get_validator_by_name
+from superset.tasks.async_queries import load_explore_json_into_cache
+from superset.typing import FlaskResponse
+from superset.utils import core as utils
+from superset.utils.async_query_manager import AsyncQueryTokenException
+from superset.utils.cache import etag_cache
+from superset.utils.core import ReservedUrlParameters
+from superset.utils.dates import now_as_float
+from superset.utils.decorators import check_dashboard_access
+from superset.views.base import (
+    api,
+    BaseSupersetView,
+    check_ownership,
+    common_bootstrap_payload,
+    create_table_permissions,
+    CsvResponse,
+    data_payload_response,
+    generate_download_headers,
+    get_error_msg,
+    get_user_roles,
+    handle_api_exception,
+    json_error_response,
+    json_errors_response,
+    json_success,
+    validate_sqlatable,
 )
-from .base import (
-    api, BaseSupersetView, CsvResponse, DeleteMixin,
-    generate_download_headers, get_error_msg, get_user_roles,
-    json_error_response, SupersetFilter, SupersetModelView, YamlExportMixin,
+from superset.views.utils import (
+    _deserialize_results_payload,
+    apply_display_max_row_limit,
+    bootstrap_user_data,
+    check_datasource_perms,
+    check_explore_cache_perms,
+    check_resource_permissions,
+    check_slice_perms,
+    get_cta_schema_name,
+    get_dashboard_extra_filters,
+    get_datasource_info,
+    get_form_data,
+    get_viz,
+    is_owner,
 )
-from .utils import bootstrap_user_data
+from superset.viz import BaseViz
 
 config = app.config
-stats_logger = config.get('STATS_LOGGER')
-log_this = models.Log.log_this
-DAR = models.DatasourceAccessRequest
-
-
-ALL_DATASOURCE_ACCESS_ERR = __(
-    'This endpoint requires the `all_datasource_access` permission')
-DATASOURCE_MISSING_ERR = __('The datasource seems to have been deleted')
-ACCESS_REQUEST_MISSING_ERR = __(
-    'The access requests seem to have been deleted')
-USER_MISSING_ERR = __('The user seems to have been deleted')
-DATASOURCE_ACCESS_ERR = __("You don't have access to this datasource")
-
-FORM_DATA_KEY_BLACKLIST = []
-if not config.get('ENABLE_JAVASCRIPT_CONTROLS'):
-    FORM_DATA_KEY_BLACKLIST = [
-        'js_tooltip',
-        'js_onclick_href',
-        'js_data_mutator',
-    ]
-
-
-def get_database_access_error_msg(database_name):
-    return __('This view requires the database %(name)s or '
-              '`all_datasource_access` permission', name=database_name)
-
-
-def get_datasource_access_error_msg(datasource_name):
-    return __('This endpoint requires the datasource %(name)s, database or '
-              '`all_datasource_access` permission', name=datasource_name)
-
-
-def json_success(json_msg, status=200):
-    return Response(json_msg, status=status, mimetype='application/json')
-
-
-def is_owner(obj, user):
-    """ Check if user is owner of the slice """
-    return obj and user in obj.owners
-
-
-def check_ownership(obj, raise_if_false=True):
-    """Meant to be used in `pre_update` hooks on models to enforce ownership
-
-    Admin have all access, and other users need to be referenced on either
-    the created_by field that comes with the ``AuditMixin``, or in a field
-    named ``owners`` which is expected to be a one-to-many with the User
-    model. It is meant to be used in the ModelView's pre_update hook in
-    which raising will abort the update.
-    """
-    if not obj:
-        return False
-
-    security_exception = SupersetSecurityException(
-        "You don't have the rights to alter [{}]".format(obj))
-
-    if g.user.is_anonymous():
-        if raise_if_false:
-            raise security_exception
-        return False
-    roles = (r.name for r in get_user_roles())
-    if 'Admin' in roles:
-        return True
-    session = db.create_scoped_session()
-    orig_obj = session.query(obj.__class__).filter_by(id=obj.id).first()
-    owner_names = (user.username for user in orig_obj.owners)
-    if (
-            hasattr(orig_obj, 'created_by') and
-            orig_obj.created_by and
-            orig_obj.created_by.username == g.user.username):
-        return True
-    if (
-            hasattr(orig_obj, 'owners') and
-            g.user and
-            hasattr(g.user, 'username') and
-            g.user.username in owner_names):
-        return True
-    if raise_if_false:
-        raise security_exception
-    else:
-        return False
-
-
-class SliceFilter(SupersetFilter):
-    def apply(self, query, func):  # noqa
-        if self.has_all_datasource_access():
-            return query
-        perms = self.get_view_menus('datasource_access')
-        # TODO(bogdan): add `schema_access` support here
-        return query.filter(self.model.perm.in_(perms))
-
-
-class DashboardFilter(SupersetFilter):
-
-    """List dashboards for which users have access to at least one slice or are owners"""
-
-    def apply(self, query, func):  # noqa
-        if self.has_all_datasource_access():
-            return query
-        Slice = models.Slice  # noqa
-        Dash = models.Dashboard  # noqa
-        User = security_manager.user_model
-        # TODO(bogdan): add `schema_access` support here
-        datasource_perms = self.get_view_menus('datasource_access')
-        slice_ids_qry = (
-            db.session
-            .query(Slice.id)
-            .filter(Slice.perm.in_(datasource_perms))
-        )
-        owner_ids_qry = (
-            db.session
-            .query(Dash.id)
-            .join(Dash.owners)
-            .filter(User.id == User.get_user_id())
-        )
-        query = query.filter(
-            or_(Dash.id.in_(
-                db.session.query(Dash.id)
-                .distinct()
-                .join(Dash.slices)
-                .filter(Slice.id.in_(slice_ids_qry)),
-            ), Dash.id.in_(owner_ids_qry)),
-        )
-        return query
-
-
-class DatabaseView(SupersetModelView, DeleteMixin, YamlExportMixin):  # noqa
-    datamodel = SQLAInterface(models.Database)
-
-    list_title = _('List Databases')
-    show_title = _('Show Database')
-    add_title = _('Add Database')
-    edit_title = _('Edit Database')
-
-    list_columns = [
-        'database_name', 'backend', 'allow_run_sync', 'allow_run_async',
-        'allow_dml', 'creator', 'modified']
-    order_columns = [
-        'database_name', 'allow_run_sync', 'allow_run_async', 'allow_dml',
-        'modified',
-    ]
-    add_columns = [
-        'database_name', 'sqlalchemy_uri', 'cache_timeout', 'extra',
-        'expose_in_sqllab', 'allow_run_sync', 'allow_run_async',
-        'allow_ctas', 'allow_dml', 'force_ctas_schema', 'impersonate_user',
-        'allow_multi_schema_metadata_fetch',
-    ]
-    search_exclude_columns = (
-        'password', 'tables', 'created_by', 'changed_by', 'queries',
-        'saved_queries')
-    edit_columns = add_columns
-    show_columns = [
-        'tables',
-        'cache_timeout',
-        'extra',
-        'database_name',
-        'sqlalchemy_uri',
-        'perm',
-        'created_by',
-        'created_on',
-        'changed_by',
-        'changed_on',
-    ]
-    add_template = 'superset/models/database/add.html'
-    edit_template = 'superset/models/database/edit.html'
-    base_order = ('changed_on', 'desc')
-    description_columns = {
-        'sqlalchemy_uri': utils.markdown(
-            'Refer to the '
-            '[SqlAlchemy docs]'
-            '(http://docs.sqlalchemy.org/en/rel_1_0/core/engines.html#'
-            'database-urls) '
-            'for more information on how to structure your URI.', True),
-        'expose_in_sqllab': _('Expose this DB in SQL Lab'),
-        'allow_run_sync': _(
-            'Allow users to run synchronous queries, this is the default '
-            'and should work well for queries that can be executed '
-            'within a web request scope (<~1 minute)'),
-        'allow_run_async': _(
-            'Allow users to run queries, against an async backend. '
-            'This assumes that you have a Celery worker setup as well '
-            'as a results backend.'),
-        'allow_ctas': _('Allow CREATE TABLE AS option in SQL Lab'),
-        'allow_dml': _(
-            'Allow users to run non-SELECT statements '
-            '(UPDATE, DELETE, CREATE, ...) '
-            'in SQL Lab'),
-        'force_ctas_schema': _(
-            'When allowing CREATE TABLE AS option in SQL Lab, '
-            'this option forces the table to be created in this schema'),
-        'extra': utils.markdown(
-            'JSON string containing extra configuration elements. '
-            'The ``engine_params`` object gets unpacked into the '
-            '[sqlalchemy.create_engine]'
-            '(http://docs.sqlalchemy.org/en/latest/core/engines.html#'
-            'sqlalchemy.create_engine) call, while the ``metadata_params`` '
-            'gets unpacked into the [sqlalchemy.MetaData]'
-            '(http://docs.sqlalchemy.org/en/rel_1_0/core/metadata.html'
-            '#sqlalchemy.schema.MetaData) call. ', True),
-        'impersonate_user': _(
-            'If Presto, all the queries in SQL Lab are going to be executed as the '
-            'currently logged on user who must have permission to run them.<br/>'
-            'If Hive and hive.server2.enable.doAs is enabled, will run the queries as '
-            'service account, but impersonate the currently logged on user '
-            'via hive.server2.proxy.user property.'),
-        'allow_multi_schema_metadata_fetch': _(
-            'Allow SQL Lab to fetch a list of all tables and all views across '
-            'all database schemas. For large data warehouse with thousands of '
-            'tables, this can be expensive and put strain on the system.'),
-    }
-    label_columns = {
-        'expose_in_sqllab': _('Expose in SQL Lab'),
-        'allow_ctas': _('Allow CREATE TABLE AS'),
-        'allow_dml': _('Allow DML'),
-        'force_ctas_schema': _('CTAS Schema'),
-        'database_name': _('Database'),
-        'creator': _('Creator'),
-        'changed_on_': _('Last Changed'),
-        'sqlalchemy_uri': _('SQLAlchemy URI'),
-        'cache_timeout': _('Cache Timeout'),
-        'extra': _('Extra'),
-        'allow_run_sync': _('Allow Run Sync'),
-        'allow_run_async': _('Allow Run Async'),
-        'impersonate_user': _('Impersonate the logged on user'),
-    }
-
-    def pre_add(self, db):
-        db.set_sqlalchemy_uri(db.sqlalchemy_uri)
-        security_manager.merge_perm('database_access', db.perm)
-        for schema in db.all_schema_names():
-            security_manager.merge_perm(
-                'schema_access', security_manager.get_schema_perm(db, schema))
-
-    def pre_update(self, db):
-        self.pre_add(db)
-
-    def _delete(self, pk):
-        DeleteMixin._delete(self, pk)
-
-
-appbuilder.add_link(
-    'Import Dashboards',
-    label=__('Import Dashboards'),
-    href='/superset/import_dashboards',
-    icon='fa-cloud-upload',
-    category='Manage',
-    category_label=__('Manage'),
-    category_icon='fa-wrench')
-
-
-appbuilder.add_view(
-    DatabaseView,
-    'Databases',
-    label=__('Databases'),
-    icon='fa-database',
-    category='Sources',
-    category_label=__('Sources'),
-    category_icon='fa-database')
-
-
-class DatabaseAsync(DatabaseView):
-    list_columns = [
-        'id', 'database_name',
-        'expose_in_sqllab', 'allow_ctas', 'force_ctas_schema',
-        'allow_run_async', 'allow_run_sync', 'allow_dml',
-        'allow_multi_schema_metadata_fetch',
-    ]
-
-
-appbuilder.add_view_no_menu(DatabaseAsync)
-
-
-class CsvToDatabaseView(SimpleFormView):
-    form = CsvToDatabaseForm
-    form_title = _('CSV to Database configuration')
-    add_columns = ['database', 'schema', 'table_name']
-
-    def form_get(self, form):
-        form.sep.data = ','
-        form.header.data = 0
-        form.mangle_dupe_cols.data = True
-        form.skipinitialspace.data = False
-        form.skip_blank_lines.data = True
-        form.infer_datetime_format.data = True
-        form.decimal.data = '.'
-        form.if_exists.data = 'append'
-
-    def form_post(self, form):
-        csv_file = form.csv_file.data
-        form.csv_file.data.filename = secure_filename(form.csv_file.data.filename)
-        csv_filename = form.csv_file.data.filename
-        path = os.path.join(config['UPLOAD_FOLDER'], csv_filename)
-        try:
-            utils.ensure_path_exists(config['UPLOAD_FOLDER'])
-            csv_file.save(path)
-            table = SqlaTable(table_name=form.name.data)
-            table.database = form.data.get('con')
-            table.database_id = table.database.id
-            table.database.db_engine_spec.create_table_from_csv(form, table)
-        except Exception as e:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            message = 'Table name {} already exists. Please pick another'.format(
-                form.name.data) if isinstance(e, IntegrityError) else text_type(e)
-            flash(
-                message,
-                'danger')
-            return redirect('/csvtodatabaseview/form')
-
-        os.remove(path)
-        # Go back to welcome page / splash screen
-        db_name = table.database.database_name
-        message = _('CSV file "{0}" uploaded to table "{1}" in '
-                    'database "{2}"'.format(csv_filename,
-                                            form.name.data,
-                                            db_name))
-        flash(message, 'info')
-        return redirect('/tablemodelview/list/')
-
-
-appbuilder.add_view_no_menu(CsvToDatabaseView)
-
-
-class DatabaseTablesAsync(DatabaseView):
-    list_columns = ['id', 'all_table_names', 'all_schema_names']
-
-
-appbuilder.add_view_no_menu(DatabaseTablesAsync)
-
-
-if config.get('ENABLE_ACCESS_REQUEST'):
-    class AccessRequestsModelView(SupersetModelView, DeleteMixin):
-        datamodel = SQLAInterface(DAR)
-        list_columns = [
-            'username', 'user_roles', 'datasource_link',
-            'roles_with_datasource', 'created_on']
-        order_columns = ['created_on']
-        base_order = ('changed_on', 'desc')
-        label_columns = {
-            'username': _('User'),
-            'user_roles': _('User Roles'),
-            'database': _('Database URL'),
-            'datasource_link': _('Datasource'),
-            'roles_with_datasource': _('Roles to grant'),
-            'created_on': _('Created On'),
-        }
-
-    appbuilder.add_view(
-        AccessRequestsModelView,
-        'Access requests',
-        label=__('Access requests'),
-        category='Security',
-        category_label=__('Security'),
-        icon='fa-table')
-
-
-class SliceModelView(SupersetModelView, DeleteMixin):  # noqa
-    datamodel = SQLAInterface(models.Slice)
-
-    list_title = _('List Charts')
-    show_title = _('Show Chart')
-    add_title = _('Add Chart')
-    edit_title = _('Edit Chart')
-
-    can_add = False
-    label_columns = {
-        'datasource_link': _('Datasource'),
-    }
-    search_columns = (
-        'slice_name', 'description', 'viz_type', 'datasource_name', 'owners',
-    )
-    list_columns = [
-        'slice_link', 'viz_type', 'datasource_link', 'creator', 'modified']
-    order_columns = ['viz_type', 'datasource_link', 'modified']
-    edit_columns = [
-        'slice_name', 'description', 'viz_type', 'owners', 'dashboards',
-        'params', 'cache_timeout']
-    base_order = ('changed_on', 'desc')
-    description_columns = {
-        'description': Markup(
-            'The content here can be displayed as widget headers in the '
-            'dashboard view. Supports '
-            '<a href="https://daringfireball.net/projects/markdown/"">'
-            'markdown</a>'),
-        'params': _(
-            'These parameters are generated dynamically when clicking '
-            'the save or overwrite button in the explore view. This JSON '
-            'object is exposed here for reference and for power users who may '
-            'want to alter specific parameters.',
-        ),
-        'cache_timeout': _(
-            'Duration (in seconds) of the caching timeout for this chart.'),
-    }
-    base_filters = [['id', SliceFilter, lambda: []]]
-    label_columns = {
-        'cache_timeout': _('Cache Timeout'),
-        'creator': _('Creator'),
-        'dashboards': _('Dashboards'),
-        'datasource_link': _('Datasource'),
-        'description': _('Description'),
-        'modified': _('Last Modified'),
-        'owners': _('Owners'),
-        'params': _('Parameters'),
-        'slice_link': _('Chart'),
-        'slice_name': _('Name'),
-        'table': _('Table'),
-        'viz_type': _('Visualization Type'),
-    }
-
-    def pre_add(self, obj):
-        utils.validate_json(obj.params)
-
-    def pre_update(self, obj):
-        utils.validate_json(obj.params)
-        check_ownership(obj)
-
-    def pre_delete(self, obj):
-        check_ownership(obj)
-
-    @expose('/add', methods=['GET', 'POST'])
-    @has_access
-    def add(self):
-        datasources = ConnectorRegistry.get_all_datasources(db.session)
-        datasources = [
-            {'value': str(d.id) + '__' + d.type, 'label': repr(d)}
-            for d in datasources
-        ]
-        return self.render_template(
-            'superset/add_slice.html',
-            bootstrap_data=json.dumps({
-                'datasources': sorted(datasources, key=lambda d: d['label']),
-            }),
-        )
-
-
-appbuilder.add_view(
-    SliceModelView,
-    'Charts',
-    label=__('Charts'),
-    icon='fa-bar-chart',
-    category='',
-    category_icon='')
-
-
-class SliceAsync(SliceModelView):  # noqa
-    list_columns = [
-        'id', 'slice_link', 'viz_type', 'slice_name',
-        'creator', 'modified', 'icons']
-    label_columns = {
-        'icons': ' ',
-        'slice_link': _('Chart'),
-    }
-
-
-appbuilder.add_view_no_menu(SliceAsync)
-
-
-class SliceAddView(SliceModelView):  # noqa
-    list_columns = [
-        'id', 'slice_name', 'slice_url', 'edit_url', 'viz_type', 'params',
-        'description', 'description_markeddown', 'datasource_id', 'datasource_type',
-        'datasource_name_text', 'datasource_link',
-        'owners', 'modified', 'changed_on']
-
-
-appbuilder.add_view_no_menu(SliceAddView)
-
-
-class DashboardModelView(SupersetModelView, DeleteMixin):  # noqa
-    datamodel = SQLAInterface(models.Dashboard)
-
-    list_title = _('List Dashboards')
-    show_title = _('Show Dashboard')
-    add_title = _('Add Dashboard')
-    edit_title = _('Edit Dashboard')
-
-    list_columns = ['dashboard_link', 'creator', 'modified']
-    order_columns = ['modified']
-    edit_columns = [
-        'dashboard_title', 'slug', 'owners', 'position_json', 'css',
-        'json_metadata']
-    show_columns = edit_columns + ['table_names', 'slices']
-    search_columns = ('dashboard_title', 'slug', 'owners')
-    add_columns = edit_columns
-    base_order = ('changed_on', 'desc')
-    description_columns = {
-        'position_json': _(
-            'This json object describes the positioning of the widgets in '
-            'the dashboard. It is dynamically generated when adjusting '
-            'the widgets size and positions by using drag & drop in '
-            'the dashboard view'),
-        'css': _(
-            'The css for individual dashboards can be altered here, or '
-            'in the dashboard view where changes are immediately '
-            'visible'),
-        'slug': _('To get a readable URL for your dashboard'),
-        'json_metadata': _(
-            'This JSON object is generated dynamically when clicking '
-            'the save or overwrite button in the dashboard view. It '
-            'is exposed here for reference and for power users who may '
-            'want to alter specific parameters.'),
-        'owners': _('Owners is a list of users who can alter the dashboard.'),
-    }
-    base_filters = [['slice', DashboardFilter, lambda: []]]
-    label_columns = {
-        'dashboard_link': _('Dashboard'),
-        'dashboard_title': _('Title'),
-        'slug': _('Slug'),
-        'slices': _('Charts'),
-        'owners': _('Owners'),
-        'creator': _('Creator'),
-        'modified': _('Modified'),
-        'position_json': _('Position JSON'),
-        'css': _('CSS'),
-        'json_metadata': _('JSON Metadata'),
-        'table_names': _('Underlying Tables'),
-    }
-
-    def pre_add(self, obj):
-        obj.slug = obj.slug.strip() or None
-        if obj.slug:
-            obj.slug = obj.slug.replace(' ', '-')
-            obj.slug = re.sub(r'[^\w\-]+', '', obj.slug)
-        if g.user not in obj.owners:
-            obj.owners.append(g.user)
-        utils.validate_json(obj.json_metadata)
-        utils.validate_json(obj.position_json)
-        owners = [o for o in obj.owners]
-        for slc in obj.slices:
-            slc.owners = list(set(owners) | set(slc.owners))
-
-    def pre_update(self, obj):
-        check_ownership(obj)
-        self.pre_add(obj)
-
-    def pre_delete(self, obj):
-        check_ownership(obj)
-
-    @action('mulexport', __('Export'), __('Export dashboards?'), 'fa-database')
-    def mulexport(self, items):
-        if not isinstance(items, list):
-            items = [items]
-        ids = ''.join('&id={}'.format(d.id) for d in items)
-        return redirect(
-            '/dashboardmodelview/export_dashboards_form?{}'.format(ids[1:]))
-
-    @expose('/export_dashboards_form')
-    def download_dashboards(self):
-        if request.args.get('action') == 'go':
-            ids = request.args.getlist('id')
-            return Response(
-                models.Dashboard.export_dashboards(ids),
-                headers=generate_download_headers('json'),
-                mimetype='application/text')
-        return self.render_template(
-            'superset/export_dashboards.html',
-            dashboards_url='/dashboardmodelview/list',
-        )
-
-
-appbuilder.add_view(
-    DashboardModelView,
-    'Dashboards',
-    label=__('Dashboards'),
-    icon='fa-dashboard',
-    category='',
-    category_icon='')
-
-
-class DashboardModelViewAsync(DashboardModelView):  # noqa
-    list_columns = [
-        'id', 'dashboard_link', 'creator', 'modified', 'dashboard_title',
-        'changed_on', 'url', 'changed_by_name',
-    ]
-    label_columns = {
-        'dashboard_link': _('Dashboard'),
-        'dashboard_title': _('Title'),
-        'creator': _('Creator'),
-        'modified': _('Modified'),
-    }
-
-
-appbuilder.add_view_no_menu(DashboardModelViewAsync)
-
-
-class DashboardAddView(DashboardModelView):  # noqa
-    list_columns = [
-        'id', 'dashboard_link', 'creator', 'modified', 'dashboard_title',
-        'changed_on', 'url', 'changed_by_name',
-    ]
-    show_columns = list(set(DashboardModelView.edit_columns + list_columns))
-
-
-appbuilder.add_view_no_menu(DashboardAddView)
-
-
-class LogModelView(SupersetModelView):
-    datamodel = SQLAInterface(models.Log)
-    list_columns = ('user', 'action', 'dttm')
-    edit_columns = ('user', 'action', 'dttm', 'json')
-    base_order = ('dttm', 'desc')
-    label_columns = {
-        'user': _('User'),
-        'action': _('Action'),
-        'dttm': _('dttm'),
-        'json': _('JSON'),
-    }
-
-
-appbuilder.add_view(
-    LogModelView,
-    'Action Log',
-    label=__('Action Log'),
-    category='Security',
-    category_label=__('Security'),
-    icon='fa-list-ol')
-
-
-@app.route('/health')
-def health():
-    return 'OK'
-
-
-@app.route('/healthcheck')
-def healthcheck():
-    return 'OK'
-
-
-@app.route('/ping')
-def ping():
-    return 'OK'
-
-
-class KV(BaseSupersetView):
-
-    """Used for storing and retrieving key value pairs"""
-
-    @log_this
-    @expose('/store/', methods=['POST'])
-    def store(self):
-        try:
-            value = request.form.get('data')
-            obj = models.KeyValue(value=value)
-            db.session.add(obj)
-            db.session.commit()
-        except Exception as e:
-            return json_error_response(e)
-        return Response(
-            json.dumps({'id': obj.id}),
-            status=200)
-
-    @log_this
-    @expose('/<key_id>/', methods=['GET'])
-    def get_value(self, key_id):
-        kv = None
-        try:
-            kv = db.session.query(models.KeyValue).filter_by(id=key_id).one()
-        except Exception as e:
-            return json_error_response(e)
-        return Response(kv.value, status=200)
-
-
-appbuilder.add_view_no_menu(KV)
-
-
-class R(BaseSupersetView):
-
-    """used for short urls"""
-
-    @log_this
-    @expose('/<url_id>')
-    def index(self, url_id):
-        url = db.session.query(models.Url).filter_by(id=url_id).first()
-        if url:
-            return redirect('/' + url.url)
-        else:
-            flash('URL to nowhere...', 'danger')
-            return redirect('/')
-
-    @log_this
-    @expose('/shortner/', methods=['POST', 'GET'])
-    def shortner(self):
-        url = request.form.get('data')
-        obj = models.Url(url=url)
-        db.session.add(obj)
-        db.session.commit()
-        return Response(
-            '{scheme}://{request.headers[Host]}/r/{obj.id}'.format(
-                scheme=request.scheme, request=request, obj=obj),
-            mimetype='text/plain')
-
-    @expose('/msg/')
-    def msg(self):
-        """Redirects to specified url while flash a message"""
-        flash(Markup(request.args.get('msg')), 'info')
-        return redirect(request.args.get('url'))
-
-
-appbuilder.add_view_no_menu(R)
-
-
-class Superset(BaseSupersetView):
+SQLLAB_QUERY_COST_ESTIMATE_TIMEOUT = config["SQLLAB_QUERY_COST_ESTIMATE_TIMEOUT"]
+stats_logger = config["STATS_LOGGER"]
+DAR = DatasourceAccessRequest
+QueryStatus = utils.QueryStatus
+logger = logging.getLogger(__name__)
+
+DATABASE_KEYS = [
+    "allow_csv_upload",
+    "allow_ctas",
+    "allow_cvas",
+    "allow_dml",
+    "allow_multi_schema_metadata_fetch",
+    "allow_run_async",
+    "allows_subquery",
+    "backend",
+    "database_name",
+    "expose_in_sqllab",
+    "force_ctas_schema",
+    "id",
+]
+
+DATASOURCE_MISSING_ERR = __("The data source seems to have been deleted")
+USER_MISSING_ERR = __("The user seems to have been deleted")
+PARAMETER_MISSING_ERR = (
+    "Please check your template parameters for syntax errors and make sure "
+    "they match across your SQL query and Set Parameters. Then, try running "
+    "your query again."
+)
+
+
+class Superset(BaseSupersetView):  # pylint: disable=too-many-public-methods
     """The base views for Superset!"""
-    def json_response(self, obj, status=200):
-        return Response(
-            json.dumps(obj, default=utils.json_int_dttm_ser),
-            status=status,
-            mimetype='application/json')
+
+    logger = logging.getLogger(__name__)
 
     @has_access_api
-    @expose('/datasources/')
-    def datasources(self):
-        datasources = ConnectorRegistry.get_all_datasources(db.session)
-        datasources = [o.short_data for o in datasources]
-        datasources = sorted(datasources, key=lambda o: o['name'])
-        return self.json_response(datasources)
+    @event_logger.log_this
+    @expose("/datasources/")
+    def datasources(self) -> FlaskResponse:
+        return self.json_response(
+            sorted(
+                [
+                    datasource.short_data
+                    for datasource in ConnectorRegistry.get_all_datasources(db.session)
+                    if datasource.short_data.get("name")
+                ],
+                key=lambda datasource: datasource["name"],
+            )
+        )
 
     @has_access_api
-    @expose('/override_role_permissions/', methods=['POST'])
-    def override_role_permissions(self):
+    @event_logger.log_this
+    @expose("/override_role_permissions/", methods=["POST"])
+    def override_role_permissions(self) -> FlaskResponse:
         """Updates the role with the give datasource permissions.
 
           Permissions not in the request will be revoked. This endpoint should
@@ -796,20 +210,20 @@ class Superset(BaseSupersetView):
         }
         """
         data = request.get_json(force=True)
-        role_name = data['role_name']
-        databases = data['database']
+        role_name = data["role_name"]
+        databases = data["database"]
 
         db_ds_names = set()
         for dbs in databases:
-            for schema in dbs['schema']:
-                for ds_name in schema['datasources']:
+            for schema in dbs["schema"]:
+                for ds_name in schema["datasources"]:
                     fullname = utils.get_datasource_full_name(
-                        dbs['name'], ds_name, schema=schema['name'])
+                        dbs["name"], ds_name, schema=schema["name"]
+                    )
                     db_ds_names.add(fullname)
 
         existing_datasources = ConnectorRegistry.get_all_datasources(db.session)
-        datasources = [
-            d for d in existing_datasources if d.full_name in db_ds_names]
+        datasources = [d for d in existing_datasources if d.full_name in db_ds_names]
         role = security_manager.find_role(role_name)
         # remove all permissions
         role.permissions = []
@@ -817,97 +231,92 @@ class Superset(BaseSupersetView):
         granted_perms = []
         for datasource in datasources:
             view_menu_perm = security_manager.find_permission_view_menu(
-                view_menu_name=datasource.perm,
-                permission_name='datasource_access')
+                view_menu_name=datasource.perm, permission_name="datasource_access"
+            )
             # prevent creating empty permissions
             if view_menu_perm and view_menu_perm.view_menu:
                 role.permissions.append(view_menu_perm)
                 granted_perms.append(view_menu_perm.view_menu.name)
         db.session.commit()
-        return self.json_response({
-            'granted': granted_perms,
-            'requested': list(db_ds_names),
-        }, status=201)
+        return self.json_response(
+            {"granted": granted_perms, "requested": list(db_ds_names)}, status=201
+        )
 
-    @log_this
     @has_access
-    @expose('/request_access/')
-    def request_access(self):
+    @event_logger.log_this
+    @expose("/request_access/")
+    def request_access(self) -> FlaskResponse:
         datasources = set()
-        dashboard_id = request.args.get('dashboard_id')
+        dashboard_id = request.args.get("dashboard_id")
         if dashboard_id:
-            dash = (
-                db.session.query(models.Dashboard)
-                .filter_by(id=int(dashboard_id))
-                .one()
-            )
+            dash = db.session.query(Dashboard).filter_by(id=int(dashboard_id)).one()
             datasources |= dash.datasources
-        datasource_id = request.args.get('datasource_id')
-        datasource_type = request.args.get('datasource_type')
-        if datasource_id:
+        datasource_id = request.args.get("datasource_id")
+        datasource_type = request.args.get("datasource_type")
+        if datasource_id and datasource_type:
             ds_class = ConnectorRegistry.sources.get(datasource_type)
             datasource = (
-                db.session.query(ds_class)
-                .filter_by(id=int(datasource_id))
-                .one()
+                db.session.query(ds_class).filter_by(id=int(datasource_id)).one()
             )
             datasources.add(datasource)
 
-        has_access = all(
+        has_access_ = all(
             (
-                datasource and security_manager.datasource_access(datasource)
+                datasource and security_manager.can_access_datasource(datasource)
                 for datasource in datasources
-            ))
-        if has_access:
-            return redirect('/superset/dashboard/{}'.format(dashboard_id))
+            )
+        )
+        if has_access_:
+            return redirect("/superset/dashboard/{}".format(dashboard_id))
 
-        if request.args.get('action') == 'go':
+        if request.args.get("action") == "go":
             for datasource in datasources:
                 access_request = DAR(
-                    datasource_id=datasource.id,
-                    datasource_type=datasource.type)
+                    datasource_id=datasource.id, datasource_type=datasource.type
+                )
                 db.session.add(access_request)
                 db.session.commit()
-            flash(__('Access was requested'), 'info')
-            return redirect('/')
+            flash(__("Access was requested"), "info")
+            return redirect("/")
 
         return self.render_template(
-            'superset/request_access.html',
+            "superset/request_access.html",
             datasources=datasources,
-            datasource_names=', '.join([o.name for o in datasources]),
+            datasource_names=", ".join([o.name for o in datasources]),
         )
 
-    @log_this
     @has_access
-    @expose('/approve')
-    def approve(self):
-        def clean_fulfilled_requests(session):
-            for r in session.query(DAR).all():
+    @event_logger.log_this
+    @expose("/approve")
+    def approve(self) -> FlaskResponse:  # pylint: disable=too-many-locals,no-self-use
+        def clean_fulfilled_requests(session: Session) -> None:
+            for dar in session.query(DAR).all():
                 datasource = ConnectorRegistry.get_datasource(
-                    r.datasource_type, r.datasource_id, session)
-                user = security_manager.get_user_by_id(r.created_by_fk)
-                if not datasource or \
-                   security_manager.datasource_access(datasource, user):
-                    # datasource does not exist anymore
-                    session.delete(r)
+                    dar.datasource_type, dar.datasource_id, session,
+                )
+                if not datasource or security_manager.can_access_datasource(datasource):
+                    # Dataset does not exist anymore
+                    session.delete(dar)
             session.commit()
-        datasource_type = request.args.get('datasource_type')
-        datasource_id = request.args.get('datasource_id')
-        created_by_username = request.args.get('created_by')
-        role_to_grant = request.args.get('role_to_grant')
-        role_to_extend = request.args.get('role_to_extend')
+
+        datasource_type = request.args["datasource_type"]
+        datasource_id = request.args["datasource_id"]
+        created_by_username = request.args.get("created_by")
+        role_to_grant = request.args.get("role_to_grant")
+        role_to_extend = request.args.get("role_to_extend")
 
         session = db.session
         datasource = ConnectorRegistry.get_datasource(
-            datasource_type, datasource_id, session)
+            datasource_type, datasource_id, session
+        )
 
         if not datasource:
-            flash(DATASOURCE_MISSING_ERR, 'alert')
+            flash(DATASOURCE_MISSING_ERR, "alert")
             return json_error_response(DATASOURCE_MISSING_ERR)
 
         requested_by = security_manager.find_user(username=created_by_username)
         if not requested_by:
-            flash(USER_MISSING_ERR, 'alert')
+            flash(USER_MISSING_ERR, "alert")
             return json_error_response(USER_MISSING_ERR)
 
         requests = (
@@ -915,675 +324,838 @@ class Superset(BaseSupersetView):
             .filter(
                 DAR.datasource_id == datasource_id,
                 DAR.datasource_type == datasource_type,
-                DAR.created_by_fk == requested_by.id)
+                DAR.created_by_fk == requested_by.id,
+            )
             .all()
         )
 
         if not requests:
-            flash(ACCESS_REQUEST_MISSING_ERR, 'alert')
-            return json_error_response(ACCESS_REQUEST_MISSING_ERR)
+            err = __("The access requests seem to have been deleted")
+            flash(err, "alert")
+            return json_error_response(err)
 
         # check if you can approve
-        if security_manager.all_datasource_access() or g.user.id == datasource.owner_id:
+        if security_manager.can_access_all_datasources() or check_ownership(
+            datasource, raise_if_false=False
+        ):
             # can by done by admin only
             if role_to_grant:
                 role = security_manager.find_role(role_to_grant)
                 requested_by.roles.append(role)
                 msg = __(
-                    '%(user)s was granted the role %(role)s that gives access '
-                    'to the %(datasource)s',
+                    "%(user)s was granted the role %(role)s that gives access "
+                    "to the %(datasource)s",
                     user=requested_by.username,
                     role=role_to_grant,
-                    datasource=datasource.full_name)
+                    datasource=datasource.full_name,
+                )
                 utils.notify_user_about_perm_udate(
-                    g.user, requested_by, role, datasource,
-                    'email/role_granted.txt', app.config)
-                flash(msg, 'info')
+                    g.user,
+                    requested_by,
+                    role,
+                    datasource,
+                    "email/role_granted.txt",
+                    app.config,
+                )
+                flash(msg, "info")
 
             if role_to_extend:
                 perm_view = security_manager.find_permission_view_menu(
-                    'email/datasource_access', datasource.perm)
+                    "email/datasource_access", datasource.perm
+                )
                 role = security_manager.find_role(role_to_extend)
                 security_manager.add_permission_role(role, perm_view)
-                msg = __('Role %(r)s was extended to provide the access to '
-                         'the datasource %(ds)s', r=role_to_extend,
-                         ds=datasource.full_name)
+                msg = __(
+                    "Role %(r)s was extended to provide the access to "
+                    "the datasource %(ds)s",
+                    r=role_to_extend,
+                    ds=datasource.full_name,
+                )
                 utils.notify_user_about_perm_udate(
-                    g.user, requested_by, role, datasource,
-                    'email/role_extended.txt', app.config)
-                flash(msg, 'info')
+                    g.user,
+                    requested_by,
+                    role,
+                    datasource,
+                    "email/role_extended.txt",
+                    app.config,
+                )
+                flash(msg, "info")
             clean_fulfilled_requests(session)
         else:
-            flash(__('You have no permission to approve this request'),
-                  'danger')
-            return redirect('/accessrequestsmodelview/list/')
-        for r in requests:
-            session.delete(r)
+            flash(__("You have no permission to approve this request"), "danger")
+            return redirect("/accessrequestsmodelview/list/")
+        for request_ in requests:
+            session.delete(request_)
         session.commit()
-        return redirect('/accessrequestsmodelview/list/')
-
-    def get_form_data(self, slice_id=None):
-        form_data = {}
-        post_data = request.form.get('form_data')
-        request_args_data = request.args.get('form_data')
-        # Supporting POST
-        if post_data:
-            form_data.update(json.loads(post_data))
-        # request params can overwrite post body
-        if request_args_data:
-            form_data.update(json.loads(request_args_data))
-
-        url_id = request.args.get('r')
-        if url_id:
-            saved_url = db.session.query(models.Url).filter_by(id=url_id).first()
-            if saved_url:
-                url_str = parse.unquote_plus(
-                    saved_url.url.split('?')[1][10:], encoding='utf-8', errors=None)
-                url_form_data = json.loads(url_str)
-                # allow form_date in request override saved url
-                url_form_data.update(form_data)
-                form_data = url_form_data
-
-        if request.args.get('viz_type'):
-            # Converting old URLs
-            form_data = cast_form_data(form_data)
-
-        form_data = {
-            k: v
-            for k, v in form_data.items()
-            if k not in FORM_DATA_KEY_BLACKLIST
-        }
-
-        # When a slice_id is present, load from DB and override
-        # the form_data from the DB with the other form_data provided
-        slice_id = form_data.get('slice_id') or slice_id
-        slc = None
-
-        if slice_id:
-            slc = db.session.query(models.Slice).filter_by(id=slice_id).first()
-            slice_form_data = slc.form_data.copy()
-            # allow form_data in request override slice from_data
-            slice_form_data.update(form_data)
-            form_data = slice_form_data
-
-        return form_data, slc
-
-    def get_viz(
-            self,
-            slice_id=None,
-            form_data=None,
-            datasource_type=None,
-            datasource_id=None,
-            force=False,
-    ):
-        if slice_id:
-            slc = (
-                db.session.query(models.Slice)
-                .filter_by(id=slice_id)
-                .one()
-            )
-            return slc.get_viz()
-        else:
-            viz_type = form_data.get('viz_type', 'table')
-            datasource = ConnectorRegistry.get_datasource(
-                datasource_type, datasource_id, db.session)
-            viz_obj = viz.viz_types[viz_type](
-                datasource,
-                form_data=form_data,
-                force=force,
-            )
-            return viz_obj
+        return redirect("/accessrequestsmodelview/list/")
 
     @has_access
-    @expose('/slice/<slice_id>/')
-    def slice(self, slice_id):
-        form_data, slc = self.get_form_data(slice_id)
-        endpoint = '/superset/explore/?form_data={}'.format(
-            parse.quote(json.dumps(form_data)),
+    @event_logger.log_this
+    @expose("/slice/<int:slice_id>/")
+    def slice(self, slice_id: int) -> FlaskResponse:  # pylint: disable=no-self-use
+        _, slc = get_form_data(slice_id, use_slice_data=True)
+        if not slc:
+            abort(404)
+        endpoint = "/superset/explore/?form_data={}".format(
+            parse.quote(json.dumps({"slice_id": slice_id}))
         )
-        if request.args.get('standalone') == 'true':
-            endpoint += '&standalone=true'
+
+        is_standalone_mode = ReservedUrlParameters.is_standalone_mode()
+        if is_standalone_mode:
+            endpoint += f"&{ReservedUrlParameters.STANDALONE}={is_standalone_mode}"
         return redirect(endpoint)
 
-    def get_query_string_response(self, viz_obj):
+    def get_query_string_response(self, viz_obj: BaseViz) -> FlaskResponse:
         query = None
         try:
             query_obj = viz_obj.query_obj()
             if query_obj:
                 query = viz_obj.datasource.get_query_str(query_obj)
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response(e)
+        except Exception as ex:  # pylint: disable=broad-except
+            err_msg = utils.error_msg_from_exception(ex)
+            logger.exception(err_msg)
+            return json_error_response(err_msg)
 
-        if query_obj and query_obj['prequeries']:
-            query_obj['prequeries'].append(query)
-            query = ';\n\n'.join(query_obj['prequeries'])
-        if query:
-            query += ';'
-        else:
-            query = 'No query.'
+        if not query:
+            query = "No query."
 
-        return Response(
-            json.dumps({
-                'query': query,
-                'language': viz_obj.datasource.query_language,
-            }),
-            status=200,
-            mimetype='application/json')
+        return self.json_response(
+            {"query": query, "language": viz_obj.datasource.query_language}
+        )
 
-    def generate_json(self, datasource_type, datasource_id, form_data,
-                      csv=False, query=False, force=False):
+    def get_raw_results(self, viz_obj: BaseViz) -> FlaskResponse:
+        payload = viz_obj.get_df_payload()
+        if viz_obj.has_error(payload):
+            return json_error_response(payload=payload, status=400)
+        return self.json_response({"data": payload["df"].to_dict("records")})
+
+    def get_samples(self, viz_obj: BaseViz) -> FlaskResponse:
+        return self.json_response({"data": viz_obj.get_samples()})
+
+    def generate_json(
+        self, viz_obj: BaseViz, response_type: Optional[str] = None
+    ) -> FlaskResponse:
+        if response_type == utils.ChartDataResultFormat.CSV:
+            return CsvResponse(
+                viz_obj.get_csv(),
+                status=200,
+                headers=generate_download_headers("csv"),
+                mimetype="application/csv",
+            )
+
+        if response_type == utils.ChartDataResultType.QUERY:
+            return self.get_query_string_response(viz_obj)
+
+        if response_type == utils.ChartDataResultType.RESULTS:
+            return self.get_raw_results(viz_obj)
+
+        if response_type == utils.ChartDataResultType.SAMPLES:
+            return self.get_samples(viz_obj)
+
+        payload = viz_obj.get_payload()
+        return data_payload_response(*viz_obj.payload_json_and_has_error(payload))
+
+    @event_logger.log_this
+    @api
+    @has_access_api
+    @expose("/slice_json/<int:slice_id>")
+    @etag_cache()
+    @check_resource_permissions(check_slice_perms)
+    def slice_json(self, slice_id: int) -> FlaskResponse:
+        form_data, slc = get_form_data(slice_id, use_slice_data=True)
+        if not slc:
+            return json_error_response("The slice does not exist")
         try:
-            viz_obj = self.get_viz(
-                datasource_type=datasource_type,
+            viz_obj = get_viz(
+                datasource_type=slc.datasource.type,
+                datasource_id=slc.datasource.id,
+                form_data=form_data,
+                force=False,
+            )
+            return self.generate_json(viz_obj)
+        except SupersetException as ex:
+            return json_error_response(utils.error_msg_from_exception(ex))
+
+    @api
+    @has_access_api
+    @event_logger.log_this
+    @expose("/annotation_json/<int:layer_id>")
+    def annotation_json(  # pylint: disable=no-self-use
+        self, layer_id: int
+    ) -> FlaskResponse:
+        form_data = get_form_data()[0]
+        form_data["layer_id"] = layer_id
+        form_data["filters"] = [{"col": "layer_id", "op": "==", "val": layer_id}]
+        # Set all_columns to ensure the TableViz returns the necessary columns to the
+        # frontend.
+        form_data["all_columns"] = [
+            "created_on",
+            "changed_on",
+            "id",
+            "start_dttm",
+            "end_dttm",
+            "layer_id",
+            "short_descr",
+            "long_descr",
+            "json_metadata",
+            "created_by_fk",
+            "changed_by_fk",
+        ]
+        datasource = AnnotationDatasource()
+        viz_obj = viz.viz_types["table"](datasource, form_data=form_data, force=False)
+        payload = viz_obj.get_payload()
+        return data_payload_response(*viz_obj.payload_json_and_has_error(payload))
+
+    @event_logger.log_this
+    @api
+    @has_access_api
+    @handle_api_exception
+    @permission_name("explore_json")
+    @expose("/explore_json/data/<cache_key>", methods=["GET"])
+    @check_resource_permissions(check_explore_cache_perms)
+    def explore_json_data(self, cache_key: str) -> FlaskResponse:
+        """Serves cached result data for async explore_json calls
+
+        `self.generate_json` receives this input and returns different
+        payloads based on the request args in the first block
+
+        TODO: form_data should not be loaded twice from cache
+          (also loaded in `check_explore_cache_perms`)
+        """
+        try:
+            cached = cache_manager.cache.get(cache_key)
+            if not cached:
+                raise CacheLoadError("Cached data not found")
+
+            form_data = cached.get("form_data")
+            response_type = cached.get("response_type")
+
+            datasource_id, datasource_type = get_datasource_info(None, None, form_data)
+
+            viz_obj = get_viz(
+                datasource_type=cast(str, datasource_type),
+                datasource_id=datasource_id,
+                form_data=form_data,
+                force_cached=True,
+            )
+
+            return self.generate_json(viz_obj, response_type)
+        except SupersetException as ex:
+            return json_error_response(utils.error_msg_from_exception(ex), 400)
+
+    EXPLORE_JSON_METHODS = ["POST"]
+    if not is_feature_enabled("ENABLE_EXPLORE_JSON_CSRF_PROTECTION"):
+        EXPLORE_JSON_METHODS.append("GET")
+
+    @api
+    @has_access_api
+    @handle_api_exception
+    @event_logger.log_this
+    @expose(
+        "/explore_json/<datasource_type>/<int:datasource_id>/",
+        methods=EXPLORE_JSON_METHODS,
+    )
+    @expose("/explore_json/", methods=EXPLORE_JSON_METHODS)
+    @etag_cache()
+    @check_resource_permissions(check_datasource_perms)
+    def explore_json(
+        self, datasource_type: Optional[str] = None, datasource_id: Optional[int] = None
+    ) -> FlaskResponse:
+        """Serves all request that GET or POST form_data
+
+        This endpoint evolved to be the entry point of many different
+        requests that GETs or POSTs a form_data.
+
+        `self.generate_json` receives this input and returns different
+        payloads based on the request args in the first block
+
+        TODO: break into one endpoint for each return shape"""
+
+        response_type = utils.ChartDataResultFormat.JSON.value
+        responses: List[
+            Union[utils.ChartDataResultFormat, utils.ChartDataResultType]
+        ] = list(utils.ChartDataResultFormat)
+        responses.extend(list(utils.ChartDataResultType))
+        for response_option in responses:
+            if request.args.get(response_option) == "true":
+                response_type = response_option
+                break
+
+        form_data = get_form_data()[0]
+
+        try:
+            datasource_id, datasource_type = get_datasource_info(
+                datasource_id, datasource_type, form_data
+            )
+
+            force = request.args.get("force") == "true"
+
+            # TODO: support CSV, SQL query and other non-JSON types
+            if (
+                is_feature_enabled("GLOBAL_ASYNC_QUERIES")
+                and response_type == utils.ChartDataResultFormat.JSON
+            ):
+                try:
+                    async_channel_id = async_query_manager.parse_jwt_from_request(
+                        request
+                    )["channel"]
+                    job_metadata = async_query_manager.init_job(async_channel_id)
+                    load_explore_json_into_cache.delay(
+                        job_metadata, form_data, response_type, force
+                    )
+                except AsyncQueryTokenException:
+                    return json_error_response("Not authorized", 401)
+
+                return json_success(json.dumps(job_metadata), status=202)
+
+            viz_obj = get_viz(
+                datasource_type=cast(str, datasource_type),
                 datasource_id=datasource_id,
                 form_data=form_data,
                 force=force,
             )
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response(
-                utils.error_msg_from_exception(e),
-                stacktrace=traceback.format_exc())
 
-        if not security_manager.datasource_access(viz_obj.datasource, g.user):
-            return json_error_response(
-                DATASOURCE_ACCESS_ERR, status=404, link=config.get(
-                    'PERMISSION_INSTRUCTIONS_LINK'))
+            return self.generate_json(viz_obj, response_type)
+        except SupersetException as ex:
+            return json_error_response(utils.error_msg_from_exception(ex), 400)
 
-        if csv:
-            return CsvResponse(
-                viz_obj.get_csv(),
-                status=200,
-                headers=generate_download_headers('csv'),
-                mimetype='application/csv')
-
-        if query:
-            return self.get_query_string_response(viz_obj)
-
-        try:
-            payload = viz_obj.get_payload()
-        except SupersetException as se:
-            logging.exception(se)
-            return json_error_response(utils.error_msg_from_exception(se),
-                                       status=se.status)
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response(utils.error_msg_from_exception(e))
-
-        status = 200
-        if (
-            payload.get('status') == QueryStatus.FAILED or
-            payload.get('error') is not None
-        ):
-            status = 400
-
-        return json_success(viz_obj.json_dumps(payload), status=status)
-
-    @log_this
-    @has_access_api
-    @expose('/slice_json/<slice_id>')
-    def slice_json(self, slice_id):
-        try:
-            form_data, slc = self.get_form_data(slice_id)
-            datasource_type = slc.datasource.type
-            datasource_id = slc.datasource.id
-
-        except Exception as e:
-            return json_error_response(
-                utils.error_msg_from_exception(e),
-                stacktrace=traceback.format_exc())
-        return self.generate_json(datasource_type=datasource_type,
-                                  datasource_id=datasource_id,
-                                  form_data=form_data)
-
-    @log_this
-    @has_access_api
-    @expose('/annotation_json/<layer_id>')
-    def annotation_json(self, layer_id):
-        form_data = self.get_form_data()[0]
-        form_data['layer_id'] = layer_id
-        form_data['filters'] = [{'col': 'layer_id',
-                                 'op': '==',
-                                 'val': layer_id}]
-        datasource = AnnotationDatasource()
-        viz_obj = viz.viz_types['table'](
-            datasource,
-            form_data=form_data,
-            force=False,
-        )
-        try:
-            payload = viz_obj.get_payload()
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response(utils.error_msg_from_exception(e))
-        status = 200
-        if payload.get('status') == QueryStatus.FAILED:
-            status = 400
-        return json_success(viz_obj.json_dumps(payload), status=status)
-
-    @log_this
-    @has_access_api
-    @expose('/explore_json/<datasource_type>/<datasource_id>/', methods=['GET', 'POST'])
-    @expose('/explore_json/', methods=['GET', 'POST'])
-    def explore_json(self, datasource_type=None, datasource_id=None):
-        try:
-            csv = request.args.get('csv') == 'true'
-            query = request.args.get('query') == 'true'
-            force = request.args.get('force') == 'true'
-            form_data = self.get_form_data()[0]
-            datasource_id, datasource_type = self.datasource_info(
-                datasource_id, datasource_type, form_data)
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response(
-                utils.error_msg_from_exception(e),
-                stacktrace=traceback.format_exc())
-        return self.generate_json(datasource_type=datasource_type,
-                                  datasource_id=datasource_id,
-                                  form_data=form_data,
-                                  csv=csv,
-                                  query=query,
-                                  force=force)
-
-    @log_this
     @has_access
-    @expose('/import_dashboards', methods=['GET', 'POST'])
-    def import_dashboards(self):
+    @event_logger.log_this
+    @expose("/import_dashboards/", methods=["GET", "POST"])
+    def import_dashboards(self) -> FlaskResponse:
         """Overrides the dashboards using json instances from the file."""
-        f = request.files.get('file')
-        if request.method == 'POST' and f:
-            current_tt = int(time.time())
-            data = json.loads(f.stream.read(), object_hook=utils.decode_dashboards)
-            # TODO: import DRUID datasources
-            for table in data['datasources']:
-                type(table).import_obj(table, import_time=current_tt)
-            db.session.commit()
-            for dashboard in data['dashboards']:
-                models.Dashboard.import_obj(
-                    dashboard, import_time=current_tt)
-            db.session.commit()
-            return redirect('/dashboardmodelview/list/')
-        return self.render_template('superset/import_dashboards.html')
+        import_file = request.files.get("file")
+        if request.method == "POST" and import_file:
+            success = False
+            database_id = request.form.get("db_id")
+            try:
+                ImportDashboardsCommand(
+                    {import_file.filename: import_file.read()}, database_id
+                ).run()
+                success = True
+            except DatabaseNotFound as ex:
+                logger.exception(ex)
+                flash(
+                    _(
+                        "Cannot import dashboard: %(db_error)s.\n"
+                        "Make sure to create the database before "
+                        "importing the dashboard.",
+                        db_error=ex,
+                    ),
+                    "danger",
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.exception(ex)
+                flash(
+                    _(
+                        "An unknown error occurred. "
+                        "Please contact your Superset administrator"
+                    ),
+                    "danger",
+                )
+            if success:
+                flash("Dashboard(s) have been imported", "success")
+                return redirect("/dashboard/list/")
 
-    @log_this
+        databases = db.session.query(Database).all()
+        return self.render_template(
+            "superset/import_dashboards.html", databases=databases
+        )
+
     @has_access
-    @expose('/explorev2/<datasource_type>/<datasource_id>/')
-    def explorev2(self, datasource_type, datasource_id):
-        """Deprecated endpoint, here for backward compatibility of urls"""
-        return redirect(url_for(
-            'Superset.explore',
-            datasource_type=datasource_type,
-            datasource_id=datasource_id,
-            **request.args))
-
-    @staticmethod
-    def datasource_info(datasource_id, datasource_type, form_data):
-        """Compatibility layer for handling of datasource info
-
-        datasource_id & datasource_type used to be passed in the URL
-        directory, now they should come as part of the form_data,
-        This function allows supporting both without duplicating code"""
-        datasource = form_data.get('datasource', '')
-        if '__' in datasource:
-            datasource_id, datasource_type = datasource.split('__')
-            # The case where the datasource has been deleted
-            datasource_id = None if datasource_id == 'None' else datasource_id
-
-        if not datasource_id:
-            raise Exception(
-                'The datasource associated with this chart no longer exists')
-        datasource_id = int(datasource_id)
-        return datasource_id, datasource_type
-
-    @log_this
-    @has_access
-    @expose('/explore/<datasource_type>/<datasource_id>/', methods=['GET', 'POST'])
-    @expose('/explore/', methods=['GET', 'POST'])
-    def explore(self, datasource_type=None, datasource_id=None):
+    @event_logger.log_this
+    @expose("/explore/<datasource_type>/<int:datasource_id>/", methods=["GET", "POST"])
+    @expose("/explore/", methods=["GET", "POST"])
+    def explore(  # pylint: disable=too-many-locals,too-many-return-statements
+        self, datasource_type: Optional[str] = None, datasource_id: Optional[int] = None
+    ) -> FlaskResponse:
         user_id = g.user.get_id() if g.user else None
-        form_data, slc = self.get_form_data()
+        form_data, slc = get_form_data(use_slice_data=True)
 
-        datasource_id, datasource_type = self.datasource_info(
-            datasource_id, datasource_type, form_data)
+        # Flash the SIP-15 message if the slice is owned by the current user and has not
+        # been updated, i.e., is not using the [start, end) interval.
+        if (
+            config["SIP_15_ENABLED"]
+            and slc
+            and g.user in slc.owners
+            and (
+                not form_data.get("time_range_endpoints")
+                or form_data["time_range_endpoints"]
+                != (
+                    utils.TimeRangeEndpoint.INCLUSIVE,
+                    utils.TimeRangeEndpoint.EXCLUSIVE,
+                )
+            )
+        ):
+            url = Href("/superset/explore/")(
+                {
+                    "form_data": json.dumps(
+                        {
+                            "slice_id": slc.id,
+                            "time_range_endpoints": (
+                                utils.TimeRangeEndpoint.INCLUSIVE.value,
+                                utils.TimeRangeEndpoint.EXCLUSIVE.value,
+                            ),
+                        }
+                    )
+                }
+            )
+            flash(Markup(config["SIP_15_TOAST_MESSAGE"].format(url=url)))
 
-        error_redirect = '/slicemodelview/list/'
-        datasource = ConnectorRegistry.get_datasource(
-            datasource_type, datasource_id, db.session)
-        if not datasource:
-            flash(DATASOURCE_MISSING_ERR, 'danger')
-            return redirect(error_redirect)
+        try:
+            datasource_id, datasource_type = get_datasource_info(
+                datasource_id, datasource_type, form_data
+            )
+        except SupersetException:
+            datasource_id = None
+            # fallback unkonw datasource to table type
+            datasource_type = SqlaTable.type
 
-        if not security_manager.datasource_access(datasource):
-            flash(
-                __(get_datasource_access_error_msg(datasource.name)),
-                'danger')
-            return redirect(
-                'superset/request_access/?'
-                'datasource_type={datasource_type}&'
-                'datasource_id={datasource_id}&'
-                ''.format(**locals()))
+        datasource: Optional[BaseDatasource] = None
+        if datasource_id is not None:
+            try:
+                datasource = ConnectorRegistry.get_datasource(
+                    cast(str, datasource_type), datasource_id, db.session
+                )
+            except DatasetNotFoundError:
+                pass
+        datasource_name = datasource.name if datasource else _("[Missing Dataset]")
 
-        viz_type = form_data.get('viz_type')
-        if not viz_type and datasource.default_endpoint:
+        if datasource:
+            if config["ENABLE_ACCESS_REQUEST"] and (
+                not security_manager.can_access_datasource(datasource)
+            ):
+                flash(
+                    __(security_manager.get_datasource_access_error_msg(datasource)),
+                    "danger",
+                )
+                return redirect(
+                    "superset/request_access/?"
+                    f"datasource_type={datasource_type}&"
+                    f"datasource_id={datasource_id}&"
+                )
+
+            # if feature enabled, run some health check rules for sqla datasource
+            if hasattr(datasource, "health_check"):
+                datasource.health_check()
+
+        viz_type = form_data.get("viz_type")
+        if not viz_type and datasource and datasource.default_endpoint:
             return redirect(datasource.default_endpoint)
 
         # slc perms
-        slice_add_perm = security_manager.can_access('can_add', 'SliceModelView')
-        slice_overwrite_perm = is_owner(slc, g.user)
-        slice_download_perm = security_manager.can_access(
-            'can_download', 'SliceModelView')
+        slice_add_perm = security_manager.can_access("can_write", "Chart")
+        slice_overwrite_perm = is_owner(slc, g.user) if slc else False
+        slice_download_perm = security_manager.can_access("can_read", "Chart")
 
-        form_data['datasource'] = str(datasource_id) + '__' + datasource_type
+        form_data["datasource"] = str(datasource_id) + "__" + cast(str, datasource_type)
 
-        # On explore, merge extra filters into the form data
-        utils.split_adhoc_filters_into_base_filters(form_data)
-        merge_extra_filters(form_data)
+        # On explore, merge legacy and extra filters into the form data
+        utils.convert_legacy_filters_into_adhoc(form_data)
+        utils.merge_extra_filters(form_data)
 
         # merge request url params
-        if request.method == 'GET':
-            merge_request_params(form_data, request.args)
+        if request.method == "GET":
+            utils.merge_request_params(form_data, request.args)
 
         # handle save or overwrite
-        action = request.args.get('action')
+        action = request.args.get("action")
 
-        if action == 'overwrite' and not slice_overwrite_perm:
+        if action == "overwrite" and not slice_overwrite_perm:
             return json_error_response(
-                _('You don\'t have the rights to ') + _('alter this ') + _('chart'),
-                status=400)
+                _("You don't have the rights to ") + _("alter this ") + _("chart"),
+                status=403,
+            )
 
-        if action == 'saveas' and not slice_add_perm:
+        if action == "saveas" and not slice_add_perm:
             return json_error_response(
-                _('You don\'t have the rights to ') + _('create a ') + _('chart'),
-                status=400)
+                _("You don't have the rights to ") + _("create a ") + _("chart"),
+                status=403,
+            )
 
-        if action in ('saveas', 'overwrite'):
+        if action in ("saveas", "overwrite") and datasource:
             return self.save_or_overwrite_slice(
-                request.args,
-                slc, slice_add_perm,
+                slc,
+                slice_add_perm,
                 slice_overwrite_perm,
                 slice_download_perm,
-                datasource_id,
-                datasource_type,
-                datasource.name)
-
-        standalone = request.args.get('standalone') == 'true'
-        bootstrap_data = {
-            'can_add': slice_add_perm,
-            'can_download': slice_download_perm,
-            'can_overwrite': slice_overwrite_perm,
-            'datasource': datasource.data,
-            'form_data': form_data,
-            'datasource_id': datasource_id,
-            'datasource_type': datasource_type,
-            'slice': slc.data if slc else None,
-            'standalone': standalone,
-            'user_id': user_id,
-            'forced_height': request.args.get('height'),
-            'common': self.common_bootsrap_payload(),
+                datasource.id,
+                datasource.type,
+                datasource.name,
+            )
+        standalone_mode = ReservedUrlParameters.is_standalone_mode()
+        dummy_datasource_data: Dict[str, Any] = {
+            "type": datasource_type,
+            "name": datasource_name,
+            "columns": [],
+            "metrics": [],
         }
-        table_name = datasource.table_name \
-            if datasource_type == 'table' \
-            else datasource.datasource_name
+        bootstrap_data = {
+            "can_add": slice_add_perm,
+            "can_download": slice_download_perm,
+            "can_overwrite": slice_overwrite_perm,
+            "datasource": datasource.data if datasource else dummy_datasource_data,
+            "form_data": form_data,
+            "datasource_id": datasource_id,
+            "datasource_type": datasource_type,
+            "slice": slc.data if slc else None,
+            "standalone": standalone_mode,
+            "user_id": user_id,
+            "forced_height": request.args.get("height"),
+            "common": common_bootstrap_payload(),
+        }
         if slc:
             title = slc.slice_name
+        elif datasource:
+            table_name = (
+                datasource.table_name
+                if datasource_type == "table"
+                else datasource.datasource_name
+            )
+            title = _("Explore - %(table)s", table=table_name)
         else:
-            title = 'Explore - ' + table_name
+            title = _("Explore")
+
         return self.render_template(
-            'superset/basic.html',
-            bootstrap_data=json.dumps(bootstrap_data),
-            entry='explore',
+            "superset/basic.html",
+            bootstrap_data=json.dumps(
+                bootstrap_data, default=utils.pessimistic_json_iso_dttm_ser
+            ),
+            entry="explore",
             title=title,
-            standalone_mode=standalone)
+            standalone_mode=standalone_mode,
+        )
 
     @api
+    @handle_api_exception
     @has_access_api
-    @expose('/filter/<datasource_type>/<datasource_id>/<column>/')
-    def filter(self, datasource_type, datasource_id, column):
+    @event_logger.log_this
+    @expose("/filter/<datasource_type>/<int:datasource_id>/<column>/")
+    def filter(  # pylint: disable=no-self-use
+        self, datasource_type: str, datasource_id: int, column: str
+    ) -> FlaskResponse:
         """
         Endpoint to retrieve values for specified column.
 
         :param datasource_type: Type of datasource e.g. table
         :param datasource_id: Datasource id
         :param column: Column name to retrieve values for
-        :return:
+        :returns: The Flask response
+        :raises SupersetSecurityException: If the user cannot access the resource
         """
         # TODO: Cache endpoint by user, datasource and column
         datasource = ConnectorRegistry.get_datasource(
-            datasource_type, datasource_id, db.session)
+            datasource_type, datasource_id, db.session,
+        )
         if not datasource:
             return json_error_response(DATASOURCE_MISSING_ERR)
-        if not security_manager.datasource_access(datasource):
-            return json_error_response(DATASOURCE_ACCESS_ERR)
 
+        datasource.raise_for_access()
         payload = json.dumps(
-            datasource.values_for_column(
-                column,
-                config.get('FILTER_SELECT_ROW_LIMIT', 10000),
-            ),
-            default=utils.json_int_dttm_ser)
+            datasource.values_for_column(column, config["FILTER_SELECT_ROW_LIMIT"]),
+            default=utils.json_int_dttm_ser,
+            ignore_nan=True,
+        )
         return json_success(payload)
 
+    @staticmethod
+    def remove_extra_filters(filters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extra filters are ones inherited from the dashboard's temporary context
+        Those should not be saved when saving the chart"""
+        return [f for f in filters if not f.get("isExtra")]
+
     def save_or_overwrite_slice(
-            self, args, slc, slice_add_perm, slice_overwrite_perm, slice_download_perm,
-            datasource_id, datasource_type, datasource_name):
+        # pylint: disable=too-many-arguments,too-many-locals,no-self-use
+        self,
+        slc: Optional[Slice],
+        slice_add_perm: bool,
+        slice_overwrite_perm: bool,
+        slice_download_perm: bool,
+        datasource_id: int,
+        datasource_type: str,
+        datasource_name: str,
+    ) -> FlaskResponse:
         """Save or overwrite a slice"""
-        slice_name = args.get('slice_name')
-        action = args.get('action')
-        form_data, _ = self.get_form_data()
+        slice_name = request.args.get("slice_name")
+        action = request.args.get("action")
+        form_data = get_form_data()[0]
 
-        if action in ('saveas'):
-            if 'slice_id' in form_data:
-                form_data.pop('slice_id')  # don't save old slice_id
-            slc = models.Slice(owners=[g.user] if g.user else [])
+        if action == "saveas":
+            if "slice_id" in form_data:
+                form_data.pop("slice_id")  # don't save old slice_id
+            slc = Slice(owners=[g.user] if g.user else [])
 
-        slc.params = json.dumps(form_data)
+        form_data["adhoc_filters"] = self.remove_extra_filters(
+            form_data.get("adhoc_filters", [])
+        )
+
+        assert slc
+        slc.params = json.dumps(form_data, indent=2, sort_keys=True)
         slc.datasource_name = datasource_name
-        slc.viz_type = form_data['viz_type']
+        slc.viz_type = form_data["viz_type"]
         slc.datasource_type = datasource_type
         slc.datasource_id = datasource_id
         slc.slice_name = slice_name
 
-        if action in ('saveas') and slice_add_perm:
-            self.save_slice(slc)
-        elif action == 'overwrite' and slice_overwrite_perm:
-            self.overwrite_slice(slc)
+        if action == "saveas" and slice_add_perm:
+            ChartDAO.save(slc)
+            msg = _("Chart [{}] has been saved").format(slc.slice_name)
+            flash(msg, "info")
+        elif action == "overwrite" and slice_overwrite_perm:
+            ChartDAO.overwrite(slc)
+            msg = _("Chart [{}] has been overwritten").format(slc.slice_name)
+            flash(msg, "info")
 
         # Adding slice to a dashboard if requested
-        dash = None
-        if request.args.get('add_to_dash') == 'existing':
-            dash = (
-                db.session.query(models.Dashboard)
-                .filter_by(id=int(request.args.get('save_to_dashboard_id')))
-                .one()
-            )
+        dash: Optional[Dashboard] = None
 
+        save_to_dashboard_id = request.args.get("save_to_dashboard_id")
+        new_dashboard_name = request.args.get("new_dashboard_name")
+        if save_to_dashboard_id:
+            # Adding the chart to an existing dashboard
+            dash = cast(
+                Dashboard,
+                db.session.query(Dashboard)
+                .filter_by(id=int(save_to_dashboard_id))
+                .one(),
+            )
             # check edit dashboard permissions
             dash_overwrite_perm = check_ownership(dash, raise_if_false=False)
             if not dash_overwrite_perm:
                 return json_error_response(
-                    _('You don\'t have the rights to ') + _('alter this ') +
-                    _('dashboard'),
-                    status=400)
+                    _("You don't have the rights to ")
+                    + _("alter this ")
+                    + _("dashboard"),
+                    status=403,
+                )
 
             flash(
-                'Slice [{}] was added to dashboard [{}]'.format(
-                    slc.slice_name,
-                    dash.dashboard_title),
-                'info')
-        elif request.args.get('add_to_dash') == 'new':
+                _("Chart [{}] was added to dashboard [{}]").format(
+                    slc.slice_name, dash.dashboard_title
+                ),
+                "info",
+            )
+        elif new_dashboard_name:
+            # Creating and adding to a new dashboard
             # check create dashboard permissions
-            dash_add_perm = security_manager.can_access('can_add', 'DashboardModelView')
+            dash_add_perm = security_manager.can_access("can_write", "Dashboard")
             if not dash_add_perm:
                 return json_error_response(
-                    _('You don\'t have the rights to ') + _('create a ') + _('dashboard'),
-                    status=400)
+                    _("You don't have the rights to ")
+                    + _("create a ")
+                    + _("dashboard"),
+                    status=403,
+                )
 
-            dash = models.Dashboard(
-                dashboard_title=request.args.get('new_dashboard_name'),
-                owners=[g.user] if g.user else [])
+            dash = Dashboard(
+                dashboard_title=request.args.get("new_dashboard_name"),
+                owners=[g.user] if g.user else [],
+            )
             flash(
-                'Dashboard [{}] just got created and slice [{}] was added '
-                'to it'.format(
-                    dash.dashboard_title,
-                    slc.slice_name),
-                'info')
+                _(
+                    "Dashboard [{}] just got created and chart [{}] was added " "to it"
+                ).format(dash.dashboard_title, slc.slice_name),
+                "info",
+            )
 
         if dash and slc not in dash.slices:
             dash.slices.append(slc)
             db.session.commit()
 
         response = {
-            'can_add': slice_add_perm,
-            'can_download': slice_download_perm,
-            'can_overwrite': is_owner(slc, g.user),
-            'form_data': slc.form_data,
-            'slice': slc.data,
+            "can_add": slice_add_perm,
+            "can_download": slice_download_perm,
+            "can_overwrite": is_owner(slc, g.user),
+            "form_data": slc.form_data,
+            "slice": slc.data,
+            "dashboard_url": dash.url if dash else None,
+            "dashboard_id": dash.id if dash else None,
         }
 
-        if request.args.get('goto_dash') == 'true':
-            response.update({'dashboard': dash.url})
+        if dash and request.args.get("goto_dash") == "true":
+            response.update({"dashboard": dash.url})
 
         return json_success(json.dumps(response))
 
-    def save_slice(self, slc):
-        session = db.session()
-        msg = 'Slice [{}] has been saved'.format(slc.slice_name)
-        session.add(slc)
-        session.commit()
-        flash(msg, 'info')
-
-    def overwrite_slice(self, slc):
-        session = db.session()
-        session.merge(slc)
-        session.commit()
-        msg = 'Slice [{}] has been overwritten'.format(slc.slice_name)
-        flash(msg, 'info')
-
     @api
     @has_access_api
-    @expose('/checkbox/<model_view>/<id_>/<attr>/<value>', methods=['GET'])
-    def checkbox(self, model_view, id_, attr, value):
-        """endpoint for checking/unchecking any boolean in a sqla model"""
-        modelview_to_model = {
-            'TableColumnInlineView':
-                ConnectorRegistry.sources['table'].column_class,
-            'DruidColumnInlineView':
-                ConnectorRegistry.sources['druid'].column_class,
-        }
-        model = modelview_to_model[model_view]
-        col = db.session.query(model).filter_by(id=id_).first()
-        checked = value == 'true'
-        if col:
-            setattr(col, attr, checked)
-            if checked:
-                metrics = col.get_metrics().values()
-                col.datasource.add_missing_metrics(metrics)
-            db.session.commit()
-        return json_success('OK')
-
-    @api
-    @has_access_api
-    @expose('/schemas/<db_id>/')
-    def schemas(self, db_id):
-        db_id = int(db_id)
-        database = (
-            db.session
-            .query(models.Database)
-            .filter_by(id=db_id)
-            .one()
+    @event_logger.log_this
+    @expose("/schemas/<int:db_id>/")
+    @expose("/schemas/<int:db_id>/<force_refresh>/")
+    def schemas(  # pylint: disable=no-self-use
+        self, db_id: int, force_refresh: str = "false"
+    ) -> FlaskResponse:
+        logger.warning(
+            "This API endpoint is deprecated and will be removed in version 2.0.0"
         )
-        schemas = database.all_schema_names()
-        schemas = security_manager.schemas_accessible_by_user(database, schemas)
-        return Response(
-            json.dumps({'schemas': schemas}),
-            mimetype='application/json')
+        db_id = int(db_id)
+        database = db.session.query(Database).get(db_id)
+        if database:
+            schemas = database.get_all_schema_names(
+                cache=database.schema_cache_enabled,
+                cache_timeout=database.schema_cache_timeout,
+                force=force_refresh.lower() == "true",
+            )
+            schemas = security_manager.get_schemas_accessible_by_user(database, schemas)
+        else:
+            schemas = []
+
+        return Response(json.dumps({"schemas": schemas}), mimetype="application/json")
 
     @api
     @has_access_api
-    @expose('/tables/<db_id>/<schema>/<substr>/')
-    def tables(self, db_id, schema, substr):
+    @event_logger.log_this
+    @expose("/tables/<int:db_id>/<schema>/<substr>/")
+    @expose("/tables/<int:db_id>/<schema>/<substr>/<force_refresh>/")
+    def tables(  # pylint: disable=too-many-locals,no-self-use
+        self, db_id: int, schema: str, substr: str, force_refresh: str = "false"
+    ) -> FlaskResponse:
         """Endpoint to fetch the list of tables for given database"""
-        db_id = int(db_id)
-        schema = utils.js_string_to_python(schema)
-        substr = utils.js_string_to_python(substr)
-        database = db.session.query(models.Database).filter_by(id=db_id).one()
-        table_names = security_manager.accessible_by_user(
-            database, database.all_table_names(schema), schema)
-        view_names = security_manager.accessible_by_user(
-            database, database.all_view_names(schema), schema)
+        # Guarantees database filtering by security access
+        query = db.session.query(Database)
+        query = DatabaseFilter("id", SQLAInterface(Database, db.session)).apply(
+            query, None
+        )
+        database = query.filter_by(id=db_id).one_or_none()
+        if not database:
+            return json_error_response("Not found", 404)
 
-        if substr:
-            table_names = [tn for tn in table_names if substr in tn]
-            view_names = [vn for vn in view_names if substr in vn]
+        force_refresh_parsed = force_refresh.lower() == "true"
+        schema_parsed = utils.parse_js_uri_path_item(schema, eval_undefined=True)
+        substr_parsed = utils.parse_js_uri_path_item(substr, eval_undefined=True)
 
-        max_items = config.get('MAX_TABLE_NAMES') or len(table_names)
-        total_items = len(table_names) + len(view_names)
-        max_tables = len(table_names)
-        max_views = len(view_names)
-        if total_items and substr:
-            max_tables = max_items * len(table_names) // total_items
-            max_views = max_items * len(view_names) // total_items
+        if schema_parsed:
+            tables = (
+                database.get_all_table_names_in_schema(
+                    schema=schema_parsed,
+                    force=force_refresh_parsed,
+                    cache=database.table_cache_enabled,
+                    cache_timeout=database.table_cache_timeout,
+                )
+                or []
+            )
+            views = (
+                database.get_all_view_names_in_schema(
+                    schema=schema_parsed,
+                    force=force_refresh_parsed,
+                    cache=database.table_cache_enabled,
+                    cache_timeout=database.table_cache_timeout,
+                )
+                or []
+            )
+        else:
+            tables = database.get_all_table_names_in_database(
+                cache=True, force=False, cache_timeout=24 * 60 * 60
+            )
+            views = database.get_all_view_names_in_database(
+                cache=True, force=False, cache_timeout=24 * 60 * 60
+            )
+        tables = security_manager.get_datasources_accessible_by_user(
+            database, tables, schema_parsed
+        )
+        views = security_manager.get_datasources_accessible_by_user(
+            database, views, schema_parsed
+        )
 
-        table_options = [{'value': tn, 'label': tn}
-                         for tn in table_names[:max_tables]]
-        table_options.extend([{'value': vn, 'label': '[view] {}'.format(vn)}
-                              for vn in view_names[:max_views]])
-        payload = {
-            'tableLength': len(table_names) + len(view_names),
-            'options': table_options,
-        }
+        def get_datasource_label(ds_name: utils.DatasourceName) -> str:
+            return (
+                ds_name.table if schema_parsed else f"{ds_name.schema}.{ds_name.table}"
+            )
+
+        if substr_parsed:
+            tables = [tn for tn in tables if substr_parsed in get_datasource_label(tn)]
+            views = [vn for vn in views if substr_parsed in get_datasource_label(vn)]
+
+        if not schema_parsed and database.default_schemas:
+            user_schema = g.user.email.split("@")[0]
+            valid_schemas = set(database.default_schemas + [user_schema])
+
+            tables = [tn for tn in tables if tn.schema in valid_schemas]
+            views = [vn for vn in views if vn.schema in valid_schemas]
+
+        max_items = config["MAX_TABLE_NAMES"] or len(tables)
+        total_items = len(tables) + len(views)
+        max_tables = len(tables)
+        max_views = len(views)
+        if total_items and substr_parsed:
+            max_tables = max_items * len(tables) // total_items
+            max_views = max_items * len(views) // total_items
+
+        dataset_tables = {table.name: table for table in database.tables}
+
+        table_options = [
+            {
+                "value": tn.table,
+                "schema": tn.schema,
+                "label": get_datasource_label(tn),
+                "title": get_datasource_label(tn),
+                "type": "table",
+                "extra": dataset_tables[f"{tn.schema}.{tn.table}"].extra_dict
+                if (f"{tn.schema}.{tn.table}" in dataset_tables)
+                else None,
+            }
+            for tn in tables[:max_tables]
+        ]
+        table_options.extend(
+            [
+                {
+                    "value": vn.table,
+                    "schema": vn.schema,
+                    "label": get_datasource_label(vn),
+                    "title": get_datasource_label(vn),
+                    "type": "view",
+                }
+                for vn in views[:max_views]
+            ]
+        )
+        table_options.sort(key=lambda value: value["label"])
+        payload = {"tableLength": len(tables) + len(views), "options": table_options}
         return json_success(json.dumps(payload))
 
     @api
     @has_access_api
-    @expose('/copy_dash/<dashboard_id>/', methods=['GET', 'POST'])
-    def copy_dash(self, dashboard_id):
+    @event_logger.log_this
+    @expose("/copy_dash/<int:dashboard_id>/", methods=["GET", "POST"])
+    def copy_dash(  # pylint: disable=no-self-use
+        self, dashboard_id: int
+    ) -> FlaskResponse:
         """Copy dashboard"""
         session = db.session()
-        data = json.loads(request.form.get('data'))
-        dash = models.Dashboard()
-        original_dash = (
-            session
-            .query(models.Dashboard)
-            .filter_by(id=dashboard_id).first())
+        data = json.loads(request.form["data"])
+        # client-side send back last_modified_time which was set when
+        # the dashboard was open. it was use to avoid mid-air collision.
+        # remove it to avoid confusion.
+        data.pop("last_modified_time", None)
+
+        dash = Dashboard()
+        original_dash = session.query(Dashboard).get(dashboard_id)
 
         dash.owners = [g.user] if g.user else []
-        dash.dashboard_title = data['dashboard_title']
+        dash.dashboard_title = data["dashboard_title"]
 
-        is_v2_dash = Superset._is_v2_dash(data['positions'])
-        if data['duplicate_slices']:
+        old_to_new_slice_ids: Dict[int, int] = {}
+        if data["duplicate_slices"]:
             # Duplicating slices as well, mapping old ids to new ones
-            old_to_new_sliceids = {}
             for slc in original_dash.slices:
                 new_slice = slc.clone()
                 new_slice.owners = [g.user] if g.user else []
                 session.add(new_slice)
                 session.flush()
                 new_slice.dashboards.append(dash)
-                old_to_new_sliceids['{}'.format(slc.id)] = \
-                    '{}'.format(new_slice.id)
+                old_to_new_slice_ids[slc.id] = new_slice.id
 
             # update chartId of layout entities
-            # in v2_dash positions json data, chartId should be integer,
-            # while in older version slice_id is string type
-            if is_v2_dash:
-                for value in data['positions'].values():
-                    if (
-                        isinstance(value, dict) and value.get('meta') and
-                        value.get('meta').get('chartId')
-                    ):
-                        old_id = '{}'.format(value.get('meta').get('chartId'))
-                        new_id = int(old_to_new_sliceids[old_id])
-                        value['meta']['chartId'] = new_id
-            else:
-                for d in data['positions']:
-                    d['slice_id'] = old_to_new_sliceids[d['slice_id']]
+            for value in data["positions"].values():
+                if isinstance(value, dict) and value.get("meta", {}).get("chartId"):
+                    old_id = value["meta"]["chartId"]
+                    new_id = old_to_new_slice_ids.get(old_id)
+                    value["meta"]["chartId"] = new_id
         else:
             dash.slices = original_dash.slices
+
         dash.params = original_dash.params
 
-        self._set_dash_metadata(dash, data)
+        DashboardDAO.set_dash_metadata(dash, data, old_to_new_slice_ids)
         session.add(dash)
         session.commit()
         dash_json = json.dumps(dash.data)
@@ -1592,485 +1164,575 @@ class Superset(BaseSupersetView):
 
     @api
     @has_access_api
-    @expose('/save_dash/<dashboard_id>/', methods=['GET', 'POST'])
-    def save_dash(self, dashboard_id):
+    @event_logger.log_this
+    @expose("/save_dash/<int:dashboard_id>/", methods=["GET", "POST"])
+    def save_dash(  # pylint: disable=no-self-use
+        self, dashboard_id: int
+    ) -> FlaskResponse:
         """Save a dashboard's metadata"""
         session = db.session()
-        dash = (session
-                .query(models.Dashboard)
-                .filter_by(id=dashboard_id).first())
+        dash = session.query(Dashboard).get(dashboard_id)
         check_ownership(dash, raise_if_false=True)
-        data = json.loads(request.form.get('data'))
-        self._set_dash_metadata(dash, data)
+        data = json.loads(request.form["data"])
+        # client-side send back last_modified_time which was set when
+        # the dashboard was open. it was use to avoid mid-air collision.
+        remote_last_modified_time = data.get("last_modified_time")
+        current_last_modified_time = dash.changed_on.replace(microsecond=0).timestamp()
+        if (
+            remote_last_modified_time
+            and remote_last_modified_time < current_last_modified_time
+        ):
+            return json_error_response(
+                __(
+                    "This dashboard was changed recently. "
+                    "Please reload dashboard to get latest version."
+                ),
+                412,
+            )
+        # remove to avoid confusion.
+        data.pop("last_modified_time", None)
+
+        DashboardDAO.set_dash_metadata(dash, data)
         session.merge(dash)
         session.commit()
+
+        # get updated changed_on
+        dash = session.query(Dashboard).get(dashboard_id)
+        last_modified_time = dash.changed_on.replace(microsecond=0).timestamp()
         session.close()
-        return 'SUCCESS'
-
-    @staticmethod
-    def _is_v2_dash(positions):
-        return (
-            isinstance(positions, dict) and
-            positions.get('DASHBOARD_VERSION_KEY') == 'v2'
+        return json_success(
+            json.dumps({"status": "SUCCESS", "last_modified_time": last_modified_time,})
         )
-
-    @staticmethod
-    def _set_dash_metadata(dashboard, data):
-        positions = data['positions']
-        is_v2_dash = Superset._is_v2_dash(positions)
-
-        # @TODO remove upon v1 deprecation
-        if not is_v2_dash:
-            positions = data['positions']
-            slice_ids = [int(d['slice_id']) for d in positions]
-            dashboard.slices = [o for o in dashboard.slices if o.id in slice_ids]
-            positions = sorted(data['positions'], key=lambda x: int(x['slice_id']))
-            dashboard.position_json = json.dumps(positions, indent=4, sort_keys=True)
-            md = dashboard.params_dict
-            dashboard.css = data['css']
-            dashboard.dashboard_title = data['dashboard_title']
-
-            if 'filter_immune_slices' not in md:
-                md['filter_immune_slices'] = []
-            if 'timed_refresh_immune_slices' not in md:
-                md['timed_refresh_immune_slices'] = []
-            if 'filter_immune_slice_fields' not in md:
-                md['filter_immune_slice_fields'] = {}
-            md['expanded_slices'] = data['expanded_slices']
-            md['default_filters'] = data.get('default_filters', '')
-            dashboard.json_metadata = json.dumps(md, indent=4)
-            return
-
-        # find slices in the position data
-        slice_ids = []
-        slice_id_to_name = {}
-        for value in positions.values():
-            if (
-                isinstance(value, dict) and value.get('meta') and
-                value.get('meta').get('chartId')
-            ):
-                slice_id = value.get('meta').get('chartId')
-                slice_ids.append(slice_id)
-                slice_id_to_name[slice_id] = value.get('meta').get('sliceName')
-
-        session = db.session()
-        Slice = models.Slice  # noqa
-        current_slices = session.query(Slice).filter(
-            Slice.id.in_(slice_ids)).all()
-
-        dashboard.slices = current_slices
-
-        # update slice names. this assumes user has permissions to update the slice
-        for slc in dashboard.slices:
-            new_name = slice_id_to_name[slc.id]
-            if slc.slice_name != new_name:
-                slc.slice_name = new_name
-                session.merge(slc)
-                session.flush()
-
-        dashboard.position_json = json.dumps(positions, indent=4, sort_keys=True)
-        md = dashboard.params_dict
-        dashboard.css = data.get('css')
-        dashboard.dashboard_title = data['dashboard_title']
-
-        if 'filter_immune_slices' not in md:
-            md['filter_immune_slices'] = []
-        if 'timed_refresh_immune_slices' not in md:
-            md['timed_refresh_immune_slices'] = []
-        if 'filter_immune_slice_fields' not in md:
-            md['filter_immune_slice_fields'] = {}
-        md['expanded_slices'] = data['expanded_slices']
-        default_filters_data = json.loads(data.get('default_filters', '{}'))
-        for key in default_filters_data.keys():
-            if int(key) not in slice_ids:
-                del default_filters_data[key]
-        md['default_filters'] = json.dumps(default_filters_data)
-        dashboard.json_metadata = json.dumps(md, indent=4)
 
     @api
     @has_access_api
-    @expose('/add_slices/<dashboard_id>/', methods=['POST'])
-    def add_slices(self, dashboard_id):
+    @event_logger.log_this
+    @expose("/add_slices/<int:dashboard_id>/", methods=["POST"])
+    def add_slices(  # pylint: disable=no-self-use
+        self, dashboard_id: int
+    ) -> FlaskResponse:
         """Add and save slices to a dashboard"""
-        data = json.loads(request.form.get('data'))
+        data = json.loads(request.form["data"])
         session = db.session()
-        Slice = models.Slice  # noqa
-        dash = (
-            session.query(models.Dashboard).filter_by(id=dashboard_id).first())
+        dash = session.query(Dashboard).get(dashboard_id)
         check_ownership(dash, raise_if_false=True)
-        new_slices = session.query(Slice).filter(
-            Slice.id.in_(data['slice_ids']))
+        new_slices = session.query(Slice).filter(Slice.id.in_(data["slice_ids"]))
         dash.slices += new_slices
         session.merge(dash)
         session.commit()
         session.close()
-        return 'SLICES ADDED'
+        return "SLICES ADDED"
 
     @api
     @has_access_api
-    @expose('/testconn', methods=['POST', 'GET'])
-    def testconn(self):
+    @event_logger.log_this
+    @expose("/testconn", methods=["POST", "GET"])
+    def testconn(  # pylint: disable=too-many-return-statements,no-self-use
+        self,
+    ) -> FlaskResponse:
         """Tests a sqla connection"""
+        db_name = request.json.get("name")
+        uri = request.json.get("uri")
         try:
-            username = g.user.username if g.user is not None else None
-            uri = request.json.get('uri')
-            db_name = request.json.get('name')
-            impersonate_user = request.json.get('impersonate_user')
-            database = None
+            if app.config["PREVENT_UNSAFE_DB_CONNECTIONS"]:
+                check_sqlalchemy_uri(make_url(uri))
+            # if the database already exists in the database, only its safe
+            # (password-masked) URI would be shown in the UI and would be passed in the
+            # form data so if the database already exists and the form was submitted
+            # with the safe URI, we assume we should retrieve the decrypted URI to test
+            # the connection.
             if db_name:
-                database = (
-                    db.session
-                    .query(models.Database)
+                existing_database = (
+                    db.session.query(Database)
                     .filter_by(database_name=db_name)
-                    .first()
+                    .one_or_none()
                 )
-                if database and uri == database.safe_sqlalchemy_uri():
-                    # the password-masked uri was passed
-                    # use the URI associated with this database
-                    uri = database.sqlalchemy_uri_decrypted
+                if existing_database and uri == existing_database.safe_sqlalchemy_uri():
+                    uri = existing_database.sqlalchemy_uri_decrypted
 
-            configuration = {}
+            # This is the database instance that will be tested. Note the extra fields
+            # are represented as JSON encoded strings in the model.
+            database = Database(
+                server_cert=request.json.get("server_cert"),
+                extra=json.dumps(request.json.get("extra", {})),
+                impersonate_user=request.json.get("impersonate_user"),
+                encrypted_extra=json.dumps(request.json.get("encrypted_extra", {})),
+            )
+            database.set_sqlalchemy_uri(uri)
+            database.db_engine_spec.mutate_db_for_connection_test(database)
 
-            if database and uri:
-                url = make_url(uri)
-                db_engine = models.Database.get_db_engine_spec_for_backend(
-                    url.get_backend_name())
-                db_engine.patch()
+            username = g.user.username if g.user is not None else None
+            engine = database.get_sqla_engine(user_name=username)
 
-                masked_url = database.get_password_masked_url_from_uri(uri)
-                logging.info('Superset.testconn(). Masked URL: {0}'.format(masked_url))
+            with closing(engine.raw_connection()) as conn:
+                if engine.dialect.do_ping(conn):
+                    return json_success('"OK"')
 
-                configuration.update(
-                    db_engine.get_configuration_for_impersonation(uri,
-                                                                  impersonate_user,
-                                                                  username),
+                raise DBAPIError(None, None, None)
+        except CertificateException as ex:
+            logger.info("Certificate exception")
+            return json_error_response(ex.message)
+        except (NoSuchModuleError, ModuleNotFoundError):
+            logger.info("Invalid driver")
+            driver_name = make_url(uri).drivername
+            return json_error_response(
+                _(
+                    "Could not load database driver: %(driver_name)s",
+                    driver_name=driver_name,
+                ),
+                400,
+            )
+        except ArgumentError:
+            logger.info("Invalid URI")
+            return json_error_response(
+                _(
+                    "Invalid connection string, a valid string usually follows:\n"
+                    "'DRIVER://USER:PASSWORD@DB-HOST/DATABASE-NAME'"
                 )
-
-            connect_args = (
-                request.json
-                .get('extras', {})
-                .get('engine_params', {})
-                .get('connect_args', {}))
-
-            if configuration:
-                connect_args['configuration'] = configuration
-
-            engine = create_engine(uri, connect_args=connect_args)
-            engine.connect()
-            return json_success(json.dumps(engine.table_names(), indent=4))
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response((
-                'Connection failed!\n\n'
-                'The error message returned was:\n{}').format(e))
+            )
+        except DBAPIError:
+            logger.warning("Connection failed")
+            return json_error_response(
+                _("Connection failed, please check your connection settings"), 400
+            )
+        except SupersetSecurityException as ex:
+            logger.warning("Stopped an unsafe database connection")
+            return json_error_response(_(str(ex)), 400)
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("Unexpected error %s", type(ex).__name__)
+            return json_error_response(
+                _("Unexpected error occurred, please check your logs for details"), 400
+            )
 
     @api
     @has_access_api
-    @expose('/recent_activity/<user_id>/', methods=['GET'])
-    def recent_activity(self, user_id):
+    @event_logger.log_this
+    @expose("/recent_activity/<int:user_id>/", methods=["GET"])
+    def recent_activity(  # pylint: disable=no-self-use
+        self, user_id: int
+    ) -> FlaskResponse:
         """Recent activity (actions) for a given user"""
-        M = models  # noqa
+        limit = request.args.get("limit")
+        limit = int(limit) if limit and limit.isdigit() else 100
+        actions = request.args.get("actions", "explore,dashboard").split(",")
+        # whether to get distinct subjects
+        distinct = request.args.get("distinct") != "false"
 
-        if request.args.get('limit'):
-            limit = int(request.args.get('limit'))
-        else:
-            limit = 1000
-
-        qry = (
-            db.session.query(M.Log, M.Dashboard, M.Slice)
-            .outerjoin(
-                M.Dashboard,
-                M.Dashboard.id == M.Log.dashboard_id,
-            )
-            .outerjoin(
-                M.Slice,
-                M.Slice.id == M.Log.slice_id,
-            )
-            .filter(
-                sqla.and_(
-                    ~M.Log.action.in_(('queries', 'shortner', 'sql_json')),
-                    M.Log.user_id == user_id,
-                ),
-            )
-            .order_by(M.Log.dttm.desc())
-            .limit(limit)
+        has_subject_title = or_(
+            and_(
+                Dashboard.dashboard_title is not None, Dashboard.dashboard_title != "",
+            ),
+            and_(Slice.slice_name is not None, Slice.slice_name != ""),
         )
+
+        if distinct:
+            one_year_ago = datetime.today() - timedelta(days=365)
+            subqry = (
+                db.session.query(
+                    Log.dashboard_id,
+                    Log.slice_id,
+                    Log.action,
+                    func.max(Log.dttm).label("dttm"),
+                )
+                .group_by(Log.dashboard_id, Log.slice_id, Log.action)
+                .filter(
+                    and_(
+                        Log.action.in_(actions),
+                        Log.user_id == user_id,
+                        # limit to one year of data to improve performance
+                        Log.dttm > one_year_ago,
+                        or_(Log.dashboard_id.isnot(None), Log.slice_id.isnot(None)),
+                    )
+                )
+                .subquery()
+            )
+            qry = (
+                db.session.query(
+                    subqry,
+                    Dashboard.slug.label("dashboard_slug"),
+                    Dashboard.dashboard_title,
+                    Slice.slice_name,
+                )
+                .outerjoin(Dashboard, Dashboard.id == subqry.c.dashboard_id)
+                .outerjoin(Slice, Slice.id == subqry.c.slice_id,)
+                .filter(has_subject_title)
+                .order_by(subqry.c.dttm.desc())
+                .limit(limit)
+            )
+        else:
+            qry = (
+                db.session.query(
+                    Log.dttm,
+                    Log.action,
+                    Log.dashboard_id,
+                    Log.slice_id,
+                    Dashboard.slug.label("dashboard_slug"),
+                    Dashboard.dashboard_title,
+                    Slice.slice_name,
+                )
+                .outerjoin(Dashboard, Dashboard.id == Log.dashboard_id)
+                .outerjoin(Slice, Slice.id == Log.slice_id)
+                .filter(has_subject_title)
+                .order_by(Log.dttm.desc())
+                .limit(limit)
+            )
+
         payload = []
         for log in qry.all():
             item_url = None
             item_title = None
-            if log.Dashboard:
-                item_url = log.Dashboard.url
-                item_title = log.Dashboard.dashboard_title
-            elif log.Slice:
-                item_url = log.Slice.slice_url
-                item_title = log.Slice.slice_name
+            item_type = None
+            if log.dashboard_id:
+                item_type = "dashboard"
+                item_url = Dashboard(id=log.dashboard_id, slug=log.dashboard_slug).url
+                item_title = log.dashboard_title
+            elif log.slice_id:
+                slc = Slice(id=log.slice_id, slice_name=log.slice_name)
+                item_type = "slice"
+                item_url = slc.slice_url
+                item_title = slc.chart
 
-            payload.append({
-                'action': log.Log.action,
-                'item_url': item_url,
-                'item_title': item_title,
-                'time': log.Log.dttm,
-            })
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+            payload.append(
+                {
+                    "action": log.action,
+                    "item_type": item_type,
+                    "item_url": item_url,
+                    "item_title": item_title,
+                    "time": log.dttm,
+                    "time_delta_humanized": humanize.naturaltime(
+                        datetime.now() - log.dttm
+                    ),
+                }
+            )
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
     @api
     @has_access_api
-    @expose('/csrf_token/', methods=['GET'])
-    def csrf_token(self):
+    @event_logger.log_this
+    @expose("/csrf_token/", methods=["GET"])
+    def csrf_token(self) -> FlaskResponse:
+        logger.warning(
+            "This API endpoint is deprecated and will be removed in version 2.0.0"
+        )
         return Response(
-            self.render_template('superset/csrf_token.json'),
-            mimetype='text/json',
+            self.render_template("superset/csrf_token.json"), mimetype="text/json"
         )
 
     @api
     @has_access_api
-    @expose('/fave_dashboards_by_username/<username>/', methods=['GET'])
-    def fave_dashboards_by_username(self, username):
+    @event_logger.log_this
+    @expose("/available_domains/", methods=["GET"])
+    def available_domains(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        """
+        Returns the list of available Superset Webserver domains (if any)
+        defined in config. This enables charts embedded in other apps to
+        leverage domain sharding if appropriately configured.
+        """
+        return Response(
+            json.dumps(conf.get("SUPERSET_WEBSERVER_DOMAINS")), mimetype="text/json"
+        )
+
+    @api
+    @has_access_api
+    @event_logger.log_this
+    @expose("/fave_dashboards_by_username/<username>/", methods=["GET"])
+    def fave_dashboards_by_username(self, username: str) -> FlaskResponse:
         """This lets us use a user's username to pull favourite dashboards"""
         user = security_manager.find_user(username=username)
         return self.fave_dashboards(user.get_id())
 
     @api
     @has_access_api
-    @expose('/fave_dashboards/<user_id>/', methods=['GET'])
-    def fave_dashboards(self, user_id):
+    @event_logger.log_this
+    @expose("/fave_dashboards/<int:user_id>/", methods=["GET"])
+    def fave_dashboards(  # pylint: disable=no-self-use
+        self, user_id: int
+    ) -> FlaskResponse:
         qry = (
-            db.session.query(
-                models.Dashboard,
-                models.FavStar.dttm,
-            )
+            db.session.query(Dashboard, FavStar.dttm)
             .join(
-                models.FavStar,
-                sqla.and_(
-                    models.FavStar.user_id == int(user_id),
-                    models.FavStar.class_name == 'Dashboard',
-                    models.Dashboard.id == models.FavStar.obj_id,
+                FavStar,
+                and_(
+                    FavStar.user_id == int(user_id),
+                    FavStar.class_name == "Dashboard",
+                    Dashboard.id == FavStar.obj_id,
                 ),
             )
-            .order_by(
-                models.FavStar.dttm.desc(),
-            )
+            .order_by(FavStar.dttm.desc())
         )
         payload = []
         for o in qry.all():
-            d = {
-                'id': o.Dashboard.id,
-                'dashboard': o.Dashboard.dashboard_link(),
-                'title': o.Dashboard.dashboard_title,
-                'url': o.Dashboard.url,
-                'dttm': o.dttm,
+            dash = {
+                "id": o.Dashboard.id,
+                "dashboard": o.Dashboard.dashboard_link(),
+                "title": o.Dashboard.dashboard_title,
+                "url": o.Dashboard.url,
+                "dttm": o.dttm,
             }
             if o.Dashboard.created_by:
                 user = o.Dashboard.created_by
-                d['creator'] = str(user)
-                d['creator_url'] = '/superset/profile/{}/'.format(
-                    user.username)
-            payload.append(d)
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+                dash["creator"] = str(user)
+                dash["creator_url"] = "/superset/profile/{}/".format(user.username)
+            payload.append(dash)
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
     @api
     @has_access_api
-    @expose('/created_dashboards/<user_id>/', methods=['GET'])
-    def created_dashboards(self, user_id):
-        Dash = models.Dashboard  # noqa
+    @event_logger.log_this
+    @expose("/created_dashboards/<int:user_id>/", methods=["GET"])
+    def created_dashboards(  # pylint: disable=no-self-use
+        self, user_id: int
+    ) -> FlaskResponse:
+        Dash = Dashboard
         qry = (
-            db.session.query(
-                Dash,
-            )
+            db.session.query(Dash)
             .filter(
-                sqla.or_(
-                    Dash.created_by_fk == user_id,
-                    Dash.changed_by_fk == user_id,
-                ),
+                or_(  # pylint: disable=comparison-with-callable
+                    Dash.created_by_fk == user_id, Dash.changed_by_fk == user_id
+                )
             )
-            .order_by(
-                Dash.changed_on.desc(),
-            )
+            .order_by(Dash.changed_on.desc())
         )
-        payload = [{
-            'id': o.id,
-            'dashboard': o.dashboard_link(),
-            'title': o.dashboard_title,
-            'url': o.url,
-            'dttm': o.changed_on,
-        } for o in qry.all()]
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+        payload = [
+            {
+                "id": o.id,
+                "dashboard": o.dashboard_link(),
+                "title": o.dashboard_title,
+                "url": o.url,
+                "dttm": o.changed_on,
+            }
+            for o in qry.all()
+        ]
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
     @api
     @has_access_api
-    @expose('/user_slices', methods=['GET'])
-    @expose('/user_slices/<user_id>/', methods=['GET'])
-    def user_slices(self, user_id=None):
-        """List of slices a user created, or faved"""
+    @event_logger.log_this
+    @expose("/user_slices", methods=["GET"])
+    @expose("/user_slices/<int:user_id>/", methods=["GET"])
+    def user_slices(  # pylint: disable=no-self-use
+        self, user_id: Optional[int] = None
+    ) -> FlaskResponse:
+        """List of slices a user owns, created, modified or faved"""
         if not user_id:
             user_id = g.user.id
-        Slice = models.Slice  # noqa
-        FavStar = models.FavStar # noqa
+
+        owner_ids_query = (
+            db.session.query(Slice.id)
+            .join(Slice.owners)
+            .filter(security_manager.user_model.id == user_id)
+        )
+
         qry = (
-            db.session.query(Slice,
-                             FavStar.dttm).join(
-                models.FavStar,
-                sqla.and_(
-                    models.FavStar.user_id == int(user_id),
-                    models.FavStar.class_name == 'slice',
-                    models.Slice.id == models.FavStar.obj_id,
+            db.session.query(Slice, FavStar.dttm)
+            .join(
+                FavStar,
+                and_(
+                    FavStar.user_id == user_id,
+                    FavStar.class_name == "slice",
+                    Slice.id == FavStar.obj_id,
                 ),
-                isouter=True).filter(
-                sqla.or_(
+                isouter=True,
+            )
+            .filter(
+                or_(
+                    Slice.id.in_(owner_ids_query),
                     Slice.created_by_fk == user_id,
                     Slice.changed_by_fk == user_id,
                     FavStar.user_id == user_id,
-                ),
+                )
             )
             .order_by(Slice.slice_name.asc())
         )
-        payload = [{
-            'id': o.Slice.id,
-            'title': o.Slice.slice_name,
-            'url': o.Slice.slice_url,
-            'data': o.Slice.form_data,
-            'dttm': o.dttm if o.dttm else o.Slice.changed_on,
-            'viz_type': o.Slice.viz_type,
-        } for o in qry.all()]
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+        payload = [
+            {
+                "id": o.Slice.id,
+                "title": o.Slice.slice_name,
+                "url": o.Slice.slice_url,
+                "data": o.Slice.form_data,
+                "dttm": o.dttm if o.dttm else o.Slice.changed_on,
+                "viz_type": o.Slice.viz_type,
+            }
+            for o in qry.all()
+        ]
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
     @api
     @has_access_api
-    @expose('/created_slices', methods=['GET'])
-    @expose('/created_slices/<user_id>/', methods=['GET'])
-    def created_slices(self, user_id=None):
+    @event_logger.log_this
+    @expose("/created_slices", methods=["GET"])
+    @expose("/created_slices/<int:user_id>/", methods=["GET"])
+    def created_slices(  # pylint: disable=no-self-use
+        self, user_id: Optional[int] = None
+    ) -> FlaskResponse:
         """List of slices created by this user"""
         if not user_id:
             user_id = g.user.id
-        Slice = models.Slice  # noqa
         qry = (
             db.session.query(Slice)
-            .filter(
-                sqla.or_(
-                    Slice.created_by_fk == user_id,
-                    Slice.changed_by_fk == user_id,
-                ),
-            )
+            .filter(or_(Slice.created_by_fk == user_id, Slice.changed_by_fk == user_id))
             .order_by(Slice.changed_on.desc())
         )
-        payload = [{
-            'id': o.id,
-            'title': o.slice_name,
-            'url': o.slice_url,
-            'dttm': o.changed_on,
-            'viz_type': o.viz_type,
-        } for o in qry.all()]
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+        payload = [
+            {
+                "id": o.id,
+                "title": o.slice_name,
+                "url": o.slice_url,
+                "dttm": o.changed_on,
+                "viz_type": o.viz_type,
+            }
+            for o in qry.all()
+        ]
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
     @api
     @has_access_api
-    @expose('/fave_slices', methods=['GET'])
-    @expose('/fave_slices/<user_id>/', methods=['GET'])
-    def fave_slices(self, user_id=None):
+    @event_logger.log_this
+    @expose("/fave_slices", methods=["GET"])
+    @expose("/fave_slices/<int:user_id>/", methods=["GET"])
+    def fave_slices(  # pylint: disable=no-self-use
+        self, user_id: Optional[int] = None
+    ) -> FlaskResponse:
         """Favorite slices for a user"""
         if not user_id:
             user_id = g.user.id
         qry = (
-            db.session.query(
-                models.Slice,
-                models.FavStar.dttm,
-            )
+            db.session.query(Slice, FavStar.dttm)
             .join(
-                models.FavStar,
-                sqla.and_(
-                    models.FavStar.user_id == int(user_id),
-                    models.FavStar.class_name == 'slice',
-                    models.Slice.id == models.FavStar.obj_id,
+                FavStar,
+                and_(
+                    FavStar.user_id == user_id,
+                    FavStar.class_name == "slice",
+                    Slice.id == FavStar.obj_id,
                 ),
             )
-            .order_by(
-                models.FavStar.dttm.desc(),
-            )
+            .order_by(FavStar.dttm.desc())
         )
         payload = []
         for o in qry.all():
-            d = {
-                'id': o.Slice.id,
-                'title': o.Slice.slice_name,
-                'url': o.Slice.slice_url,
-                'dttm': o.dttm,
-                'viz_type': o.Slice.viz_type,
+            dash = {
+                "id": o.Slice.id,
+                "title": o.Slice.slice_name,
+                "url": o.Slice.slice_url,
+                "dttm": o.dttm,
+                "viz_type": o.Slice.viz_type,
             }
             if o.Slice.created_by:
                 user = o.Slice.created_by
-                d['creator'] = str(user)
-                d['creator_url'] = '/superset/profile/{}/'.format(
-                    user.username)
-            payload.append(d)
-        return json_success(
-            json.dumps(payload, default=utils.json_int_dttm_ser))
+                dash["creator"] = str(user)
+                dash["creator_url"] = "/superset/profile/{}/".format(user.username)
+            payload.append(dash)
+        return json_success(json.dumps(payload, default=utils.json_int_dttm_ser))
 
+    @event_logger.log_this
     @api
     @has_access_api
-    @expose('/warm_up_cache/', methods=['GET'])
-    def warm_up_cache(self):
+    @expose("/warm_up_cache/", methods=["GET"])
+    def warm_up_cache(  # pylint: disable=too-many-locals,no-self-use
+        self,
+    ) -> FlaskResponse:
         """Warms up the cache for the slice or table.
 
         Note for slices a force refresh occurs.
+
+        In terms of the `extra_filters` these can be obtained from records in the JSON
+        encoded `logs.json` column associated with the `explore_json` action.
         """
-        slices = None
         session = db.session()
-        slice_id = request.args.get('slice_id')
-        table_name = request.args.get('table_name')
-        db_name = request.args.get('db_name')
+        slice_id = request.args.get("slice_id")
+        dashboard_id = request.args.get("dashboard_id")
+        table_name = request.args.get("table_name")
+        db_name = request.args.get("db_name")
+        extra_filters = request.args.get("extra_filters")
+        slices: List[Slice] = []
 
         if not slice_id and not (table_name and db_name):
-            return json_error_response(__(
-                'Malformed request. slice_id or table_name and db_name '
-                'arguments are expected'), status=400)
+            return json_error_response(
+                __(
+                    "Malformed request. slice_id or table_name and db_name "
+                    "arguments are expected"
+                ),
+                status=400,
+            )
         if slice_id:
-            slices = session.query(models.Slice).filter_by(id=slice_id).all()
+            slices = session.query(Slice).filter_by(id=slice_id).all()
             if not slices:
-                return json_error_response(__(
-                    'Chart %(id)s not found', id=slice_id), status=404)
+                return json_error_response(
+                    __("Chart %(id)s not found", id=slice_id), status=404
+                )
         elif table_name and db_name:
-            SqlaTable = ConnectorRegistry.sources['table']
             table = (
                 session.query(SqlaTable)
-                .join(models.Database)
+                .join(Database)
                 .filter(
-                    models.Database.database_name == db_name or
-                    SqlaTable.table_name == table_name)
-            ).first()
+                    Database.database_name == db_name
+                    or SqlaTable.table_name == table_name
+                )
+            ).one_or_none()
             if not table:
-                return json_error_response(__(
-                    "Table %(t)s wasn't found in the database %(d)s",
-                    t=table_name, s=db_name), status=404)
-            slices = session.query(models.Slice).filter_by(
-                datasource_id=table.id,
-                datasource_type=table.type).all()
+                return json_error_response(
+                    __(
+                        "Table %(table)s wasn't found in the database %(db)s",
+                        table=table_name,
+                        db=db_name,
+                    ),
+                    status=404,
+                )
+            slices = (
+                session.query(Slice)
+                .filter_by(datasource_id=table.id, datasource_type=table.type)
+                .all()
+            )
+
+        result = []
 
         for slc in slices:
             try:
-                obj = slc.get_viz(force=True)
-                obj.get_json()
-            except Exception as e:
-                return json_error_response(utils.error_msg_from_exception(e))
-        return json_success(json.dumps(
-            [{'slice_id': slc.id, 'slice_name': slc.slice_name}
-             for slc in slices]))
+                form_data = get_form_data(slc.id, use_slice_data=True)[0]
+                if dashboard_id:
+                    form_data["extra_filters"] = (
+                        json.loads(extra_filters)
+                        if extra_filters
+                        else get_dashboard_extra_filters(slc.id, dashboard_id)
+                    )
 
-    @expose('/favstar/<class_name>/<obj_id>/<action>/')
-    def favstar(self, class_name, obj_id, action):
+                obj = get_viz(
+                    datasource_type=slc.datasource.type,
+                    datasource_id=slc.datasource.id,
+                    form_data=form_data,
+                    force=True,
+                )
+
+                g.form_data = form_data
+                payload = obj.get_payload()
+                delattr(g, "form_data")
+                error = payload["errors"] or None
+                status = payload["status"]
+            except Exception as ex:  # pylint: disable=broad-except
+                error = utils.error_msg_from_exception(ex)
+                status = None
+
+            result.append(
+                {"slice_id": slc.id, "viz_error": error, "viz_status": status}
+            )
+
+        return json_success(json.dumps(result))
+
+    @has_access_api
+    @event_logger.log_this
+    @expose("/favstar/<class_name>/<int:obj_id>/<action>/")
+    def favstar(  # pylint: disable=no-self-use
+        self, class_name: str, obj_id: int, action: str
+    ) -> FlaskResponse:
         """Toggle favorite stars on Slices and Dashboard"""
         session = db.session()
-        FavStar = models.FavStar  # noqa
         count = 0
-        favs = session.query(FavStar).filter_by(
-            class_name=class_name, obj_id=obj_id,
-            user_id=g.user.get_id()).all()
-        if action == 'select':
+        favs = (
+            session.query(FavStar)
+            .filter_by(class_name=class_name, obj_id=obj_id, user_id=g.user.get_id())
+            .all()
+        )
+        if action == "select":
             if not favs:
                 session.add(
                     FavStar(
@@ -2078,155 +1740,176 @@ class Superset(BaseSupersetView):
                         obj_id=obj_id,
                         user_id=g.user.get_id(),
                         dttm=datetime.now(),
-                    ),
+                    )
                 )
             count = 1
-        elif action == 'unselect':
+        elif action == "unselect":
             for fav in favs:
                 session.delete(fav)
         else:
             count = len(favs)
         session.commit()
-        return json_success(json.dumps({'count': count}))
+        return json_success(json.dumps({"count": count}))
+
+    @api
+    @has_access_api
+    @event_logger.log_this
+    @expose("/dashboard/<int:dashboard_id>/published/", methods=("GET", "POST"))
+    def publish(  # pylint: disable=no-self-use
+        self, dashboard_id: int
+    ) -> FlaskResponse:
+        """Gets and toggles published status on dashboards"""
+        logger.warning(
+            "This API endpoint is deprecated and will be removed in version 2.0.0"
+        )
+        session = db.session()
+        Role = ab_models.Role
+        dash = (
+            session.query(Dashboard).filter(Dashboard.id == dashboard_id).one_or_none()
+        )
+        admin_role = session.query(Role).filter(Role.name == "Admin").one_or_none()
+
+        if request.method == "GET":
+            if dash:
+                return json_success(json.dumps({"published": dash.published}))
+
+            return json_error_response(
+                f"ERROR: cannot find dashboard {dashboard_id}", status=404
+            )
+
+        edit_perm = is_owner(dash, g.user) or admin_role in get_user_roles()
+        if not edit_perm:
+            return json_error_response(
+                f'ERROR: "{g.user.username}" cannot alter '
+                f'dashboard "{dash.dashboard_title}"',
+                status=403,
+            )
+
+        dash.published = str(request.form["published"]).lower() == "true"
+        session.commit()
+        return json_success(json.dumps({"published": dash.published}))
 
     @has_access
-    @expose('/dashboard/<dashboard_id>/')
-    def dashboard(self, dashboard_id):
-        """Server side rendering for a dashboard"""
-        session = db.session()
-        qry = session.query(models.Dashboard)
-        if dashboard_id.isdigit():
-            qry = qry.filter_by(id=int(dashboard_id))
-        else:
-            qry = qry.filter_by(slug=dashboard_id)
+    @expose("/dashboard/<dashboard_id_or_slug>/")
+    @event_logger.log_this_with_extra_payload
+    @check_dashboard_access(
+        on_error=lambda self, ex: Response(
+            utils.error_msg_from_exception(ex), status=403
+        )
+    )
+    def dashboard(  # pylint: disable=too-many-locals
+        self,  # pylint: disable=no-self-use
+        dashboard_id_or_slug: str,  # pylint: disable=unused-argument
+        add_extra_log_payload: Callable[..., None] = lambda **kwargs: None,
+        dashboard: Optional[Dashboard] = None,
+    ) -> FlaskResponse:
+        """
+        Server side rendering for a dashboard
+        :param dashboard_id_or_slug: identifier for dashboard. used in the decorators
+        :param add_extra_log_payload: added by `log_this_with_manual_updates`, set a default value to appease pylint
+        :param dashboard: added by `check_dashboard_access`
+        """
+        if not dashboard:
+            abort(404)
 
-        dash = qry.one()
-        datasources = set()
-        for slc in dash.slices:
-            datasource = slc.datasource
-            if datasource:
-                datasources.add(datasource)
+        data = dashboard.full_data()
 
-        if config.get('ENABLE_ACCESS_REQUEST'):
-            for datasource in datasources:
-                if datasource and not security_manager.datasource_access(datasource):
+        if config["ENABLE_ACCESS_REQUEST"]:
+            for datasource in data["datasources"].values():
+                datasource = ConnectorRegistry.get_datasource(
+                    datasource_type=datasource["type"],
+                    datasource_id=datasource["id"],
+                    session=db.session(),
+                )
+                if datasource and not security_manager.can_access_datasource(
+                    datasource=datasource
+                ):
                     flash(
-                        __(get_datasource_access_error_msg(datasource.name)),
-                        'danger')
+                        __(
+                            security_manager.get_datasource_access_error_msg(datasource)
+                        ),
+                        "danger",
+                    )
                     return redirect(
-                        'superset/request_access/?'
-                        'dashboard_id={dash.id}&'.format(**locals()))
+                        f"/superset/request_access/?dashboard_id={dashboard.id}"
+                    )
 
-        dash_edit_perm = check_ownership(dash, raise_if_false=False) and \
-            security_manager.can_access('can_save_dash', 'Superset')
-        dash_save_perm = security_manager.can_access('can_save_dash', 'Superset')
-        superset_can_explore = security_manager.can_access('can_explore', 'Superset')
-        slice_can_edit = security_manager.can_access('can_edit', 'SliceModelView')
-
-        standalone_mode = request.args.get('standalone') == 'true'
-        edit_mode = request.args.get('edit') == 'true'
-
-        # TODO remove switch upon v1 deprecation 🎉
-        # during v2 rollout, multiple factors determine whether we show v1 or v2
-        # if layout == v1
-        #   view = v1 for non-editors
-        #   view = v1 or v2 for editors depending on config + request (force)
-        #   edit = v1 or v2 for editors depending on config + request (force)
-        #
-        # if layout == v2 (not backwards compatible)
-        #   view = v2
-        #   edit = v2
-        dashboard_layout = dash.data.get('position_json', {})
-        is_v2_dash = (
-            isinstance(dashboard_layout, dict) and
-            dashboard_layout.get('DASHBOARD_VERSION_KEY') == 'v2'
+        dash_edit_perm = check_ownership(
+            dashboard, raise_if_false=False
+        ) and security_manager.can_access("can_save_dash", "Superset")
+        dash_save_perm = security_manager.can_access("can_save_dash", "Superset")
+        superset_can_explore = security_manager.can_access("can_explore", "Superset")
+        superset_can_csv = security_manager.can_access("can_csv", "Superset")
+        slice_can_edit = security_manager.can_access("can_edit", "SliceModelView")
+        standalone_mode = ReservedUrlParameters.is_standalone_mode()
+        edit_mode = (
+            request.args.get(utils.ReservedUrlParameters.EDIT_MODE.value) == "true"
         )
 
-        force_v1 = request.args.get('version') == 'v1' and not is_v2_dash
-        force_v2 = request.args.get('version') == 'v2'
-        force_v2_edit = (
-            is_v2_dash or
-            not app.config.get('CAN_FALLBACK_TO_DASH_V1_EDIT_MODE')
-        )
-        v2_is_default_view = app.config.get('DASH_V2_IS_DEFAULT_VIEW_FOR_EDITORS')
-        prompt_v2_conversion = False
-        if is_v2_dash:
-            dashboard_view = 'v2'
-        elif not dash_edit_perm:
-            dashboard_view = 'v1'
-        else:
-            if force_v2 or (v2_is_default_view and not force_v1):
-                dashboard_view = 'v2'
-            else:
-                dashboard_view = 'v1'
-                prompt_v2_conversion = not force_v1
-
-        # Hack to log the dashboard_id properly, even when getting a slug
-        @log_this
-        def dashboard(**kwargs):  # noqa
-            pass
-
-        # TODO remove extra logging upon v1 deprecation 🎉
-        dashboard(
-            dashboard_id=dash.id,
-            dashboard_version='v2' if is_v2_dash else 'v1',
-            dashboard_view=dashboard_view,
+        add_extra_log_payload(
+            dashboard_id=dashboard.id,
+            dashboard_version="v2",
             dash_edit_perm=dash_edit_perm,
-            force_v1=force_v1,
-            force_v2=force_v2,
-            force_v2_edit=force_v2_edit,
-            edit_mode=edit_mode)
+            edit_mode=edit_mode,
+        )
 
-        dashboard_data = dash.data
-        dashboard_data.update({
-            'standalone_mode': standalone_mode,
-            'dash_save_perm': dash_save_perm,
-            'dash_edit_perm': dash_edit_perm,
-            'superset_can_explore': superset_can_explore,
-            'slice_can_edit': slice_can_edit,
-        })
+        if is_feature_enabled("REMOVE_SLICE_LEVEL_LABEL_COLORS"):
+            # dashboard metadata has dashboard-level label_colors,
+            # so remove slice-level label_colors from its form_data
+            for slc in data["slices"]:
+                form_data = slc.get("form_data")
+                form_data.pop("label_colors", None)
 
-        bootstrap_data = {
-            'user_id': g.user.get_id(),
-            'dashboard_data': dashboard_data,
-            'datasources': {ds.uid: ds.data for ds in datasources},
-            'common': self.common_bootsrap_payload(),
-            'editMode': edit_mode,
-            # TODO remove the following upon v1 deprecation 🎉
-            'force_v2_edit': force_v2_edit,
-            'prompt_v2_conversion': prompt_v2_conversion,
-            'v2_auto_convert_date': app.config.get('PLANNED_V2_AUTO_CONVERT_DATE'),
-            'v2_feedback_url': app.config.get('V2_FEEDBACK_URL'),
+        url_params = {
+            key: value
+            for key, value in request.args.items()
+            if key not in [param.value for param in utils.ReservedUrlParameters]
         }
 
-        if request.args.get('json') == 'true':
-            return json_success(json.dumps(bootstrap_data))
+        bootstrap_data = {
+            "user_id": g.user.get_id(),
+            "common": common_bootstrap_payload(),
+            "editMode": edit_mode,
+            "urlParams": url_params,
+            "dashboard_data": {
+                **data["dashboard"],
+                "standalone_mode": standalone_mode,
+                "dash_save_perm": dash_save_perm,
+                "dash_edit_perm": dash_edit_perm,
+                "superset_can_explore": superset_can_explore,
+                "superset_can_csv": superset_can_csv,
+                "slice_can_edit": slice_can_edit,
+            },
+            "datasources": data["datasources"],
+        }
 
-        if dashboard_view == 'v2':
-            entry = 'dashboard'
-            template = 'superset/dashboard.html'
-        else:
-            entry = 'dashboard_deprecated'
-            template = 'superset/dashboard_v1_deprecated.html'
+        if request.args.get("json") == "true":
+            return json_success(
+                json.dumps(bootstrap_data, default=utils.pessimistic_json_iso_dttm_ser)
+            )
 
         return self.render_template(
-            template,
-            entry=entry,
+            "superset/dashboard.html",
+            entry="dashboard",
             standalone_mode=standalone_mode,
-            title=dash.dashboard_title,
-            bootstrap_data=json.dumps(bootstrap_data),
+            title=dashboard.dashboard_title,
+            custom_css=dashboard.css,
+            bootstrap_data=json.dumps(
+                bootstrap_data, default=utils.pessimistic_json_iso_dttm_ser
+            ),
         )
 
     @api
-    @log_this
-    @expose('/log/', methods=['POST'])
-    def log(self):
+    @has_access
+    @event_logger.log_this
+    @expose("/log/", methods=["POST"])
+    def log(self) -> FlaskResponse:  # pylint: disable=no-self-use
         return Response(status=200)
 
     @has_access
-    @expose('/sync_druid/', methods=['POST'])
-    @log_this
-    def sync_druid_source(self):
+    @expose("/sync_druid/", methods=["POST"])
+    @event_logger.log_this
+    def sync_druid_source(self) -> FlaskResponse:  # pylint: disable=no-self-use
         """Syncs the druid datasource in main db with the provided config.
 
         The endpoint takes 3 arguments:
@@ -2248,499 +1931,815 @@ class Superset(BaseSupersetView):
             }
         """
         payload = request.get_json(force=True)
-        druid_config = payload['config']
-        user_name = payload['user']
-        cluster_name = payload['cluster']
+        druid_config = payload["config"]
+        user_name = payload["user"]
+        cluster_name = payload["cluster"]
 
         user = security_manager.find_user(username=user_name)
-        DruidDatasource = ConnectorRegistry.sources['druid']
-        DruidCluster = DruidDatasource.cluster_class
+        DruidDatasource = ConnectorRegistry.sources[  # pylint: disable=invalid-name
+            "druid"
+        ]
+        DruidCluster = DruidDatasource.cluster_class  # pylint: disable=invalid-name
         if not user:
-            err_msg = __("Can't find User '%(name)s', please ask your admin "
-                         'to create one.', name=user_name)
-            logging.error(err_msg)
+            err_msg = __(
+                "Can't find User '%(name)s', please ask your admin " "to create one.",
+                name=user_name,
+            )
+            logger.error(err_msg)
             return json_error_response(err_msg)
-        cluster = db.session.query(DruidCluster).filter_by(
-            cluster_name=cluster_name).first()
+        cluster = (
+            db.session.query(DruidCluster)
+            .filter_by(cluster_name=cluster_name)
+            .one_or_none()
+        )
         if not cluster:
-            err_msg = __("Can't find DruidCluster with cluster_name = "
-                         "'%(name)s'", name=cluster_name)
-            logging.error(err_msg)
+            err_msg = __(
+                "Can't find DruidCluster with cluster_name = " "'%(name)s'",
+                name=cluster_name,
+            )
+            logger.error(err_msg)
             return json_error_response(err_msg)
         try:
-            DruidDatasource.sync_to_db_from_config(
-                druid_config, user, cluster)
-        except Exception as e:
-            logging.exception(utils.error_msg_from_exception(e))
-            return json_error_response(utils.error_msg_from_exception(e))
+            DruidDatasource.sync_to_db_from_config(druid_config, user, cluster)
+        except Exception as ex:  # pylint: disable=broad-except
+            err_msg = utils.error_msg_from_exception(ex)
+            logger.exception(err_msg)
+            return json_error_response(err_msg)
         return Response(status=201)
 
     @has_access
-    @expose('/sqllab_viz/', methods=['POST'])
-    @log_this
-    def sqllab_viz(self):
-        SqlaTable = ConnectorRegistry.sources['table']
-        data = json.loads(request.form.get('data'))
-        table_name = data.get('datasourceName')
-        template_params = data.get('templateParams')
+    @expose("/get_or_create_table/", methods=["POST"])
+    @event_logger.log_this
+    def sqllab_table_viz(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        """Gets or creates a table object with attributes passed to the API.
+
+        It expects the json with params:
+        * datasourceName - e.g. table name, required
+        * dbId - database id, required
+        * schema - table schema, optional
+        * templateParams - params for the Jinja templating syntax, optional
+        :return: Response
+        """
+        data = json.loads(request.form["data"])
+        table_name = data["datasourceName"]
+        database_id = data["dbId"]
         table = (
             db.session.query(SqlaTable)
-            .filter_by(table_name=table_name)
-            .first()
+            .filter_by(database_id=database_id, table_name=table_name)
+            .one_or_none()
         )
         if not table:
-            table = SqlaTable(table_name=table_name)
-        table.database_id = data.get('dbId')
-        table.schema = data.get('schema')
-        table.template_params = data.get('templateParams')
+            # Create table if doesn't exist.
+            with db.session.no_autoflush:
+                table = SqlaTable(table_name=table_name, owners=[g.user])
+                table.database_id = database_id
+                table.database = (
+                    db.session.query(Database).filter_by(id=database_id).one()
+                )
+                table.schema = data.get("schema")
+                table.template_params = data.get("templateParams")
+                # needed for the table validation.
+                validate_sqlatable(table)
+
+            db.session.add(table)
+            table.fetch_metadata()
+            create_table_permissions(table)
+            db.session.commit()
+
+        return json_success(json.dumps({"table_id": table.id}))
+
+    @has_access
+    @expose("/sqllab_viz/", methods=["POST"])
+    @event_logger.log_this
+    def sqllab_viz(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        data = json.loads(request.form["data"])
+        try:
+            table_name = data["datasourceName"]
+            database_id = data["dbId"]
+        except KeyError:
+            return json_error_response("Missing required fields", status=400)
+        database = db.session.query(Database).get(database_id)
+        if not database:
+            return json_error_response("Database not found", status=400)
+        table = (
+            db.session.query(SqlaTable)
+            .filter_by(database_id=database_id, table_name=table_name)
+            .one_or_none()
+        )
+        if not table:
+            table = SqlaTable(table_name=table_name, owners=[g.user])
+        table.database = database
+        table.schema = data.get("schema")
+        table.template_params = data.get("templateParams")
         table.is_sqllab_view = True
-        q = SupersetQuery(data.get('sql'))
-        table.sql = q.stripped()
+        table.sql = ParsedQuery(data.get("sql")).stripped()
         db.session.add(table)
         cols = []
-        dims = []
-        metrics = []
-        for column_name, config in data.get('columns').items():
-            is_dim = config.get('is_dim', False)
-            SqlaTable = ConnectorRegistry.sources['table']
-            TableColumn = SqlaTable.column_class
-            SqlMetric = SqlaTable.metric_class
+        for config_ in data.get("columns"):
+            column_name = config_.get("name")
             col = TableColumn(
                 column_name=column_name,
-                filterable=is_dim,
-                groupby=is_dim,
-                is_dttm=config.get('is_date', False),
-                type=config.get('type', False),
+                filterable=True,
+                groupby=True,
+                is_dttm=config_.get("is_date", False),
+                type=config_.get("type", False),
             )
             cols.append(col)
-            if is_dim:
-                dims.append(col)
-            agg = config.get('agg')
-            if agg:
-                if agg == 'count_distinct':
-                    metrics.append(SqlMetric(
-                        metric_name='{agg}__{column_name}'.format(**locals()),
-                        expression='COUNT(DISTINCT {column_name})'
-                        .format(**locals()),
-                    ))
-                else:
-                    metrics.append(SqlMetric(
-                        metric_name='{agg}__{column_name}'.format(**locals()),
-                        expression='{agg}({column_name})'.format(**locals()),
-                    ))
-        if not metrics:
-            metrics.append(SqlMetric(
-                metric_name='count'.format(**locals()),
-                expression='count(*)'.format(**locals()),
-            ))
+
         table.columns = cols
-        table.metrics = metrics
+        table.metrics = [SqlMetric(metric_name="count", expression="count(*)")]
         db.session.commit()
-        return self.json_response(json.dumps({
-            'table_id': table.id,
-        }))
+        return json_success(json.dumps({"table_id": table.id}))
 
     @has_access
-    @expose('/table/<database_id>/<table_name>/<schema>/')
-    @log_this
-    def table(self, database_id, table_name, schema):
-        schema = utils.js_string_to_python(schema)
-        mydb = db.session.query(models.Database).filter_by(id=database_id).one()
-        payload_columns = []
-        indexes = []
-        primary_key = []
-        foreign_keys = []
-        try:
-            columns = mydb.get_columns(table_name, schema)
-            indexes = mydb.get_indexes(table_name, schema)
-            primary_key = mydb.get_pk_constraint(table_name, schema)
-            foreign_keys = mydb.get_foreign_keys(table_name, schema)
-        except Exception as e:
-            return json_error_response(utils.error_msg_from_exception(e))
-        keys = []
-        if primary_key and primary_key.get('constrained_columns'):
-            primary_key['column_names'] = primary_key.pop('constrained_columns')
-            primary_key['type'] = 'pk'
-            keys += [primary_key]
-        for fk in foreign_keys:
-            fk['column_names'] = fk.pop('constrained_columns')
-            fk['type'] = 'fk'
-        keys += foreign_keys
-        for idx in indexes:
-            idx['type'] = 'index'
-        keys += indexes
-
-        for col in columns:
-            dtype = ''
-            try:
-                dtype = '{}'.format(col['type'])
-            except Exception:
-                pass
-            payload_columns.append({
-                'name': col['name'],
-                'type': dtype.split('(')[0] if '(' in dtype else dtype,
-                'longType': dtype,
-                'keys': [
-                    k for k in keys
-                    if col['name'] in k.get('column_names')
-                ],
-            })
-        tbl = {
-            'name': table_name,
-            'columns': payload_columns,
-            'selectStar': mydb.select_star(
-                table_name, schema=schema, show_cols=True, indent=True,
-                cols=columns, latest_partition=False),
-            'primaryKey': primary_key,
-            'foreignKeys': foreign_keys,
-            'indexes': keys,
-        }
-        return json_success(json.dumps(tbl))
-
-    @has_access
-    @expose('/extra_table_metadata/<database_id>/<table_name>/<schema>/')
-    @log_this
-    def extra_table_metadata(self, database_id, table_name, schema):
-        schema = utils.js_string_to_python(schema)
-        mydb = db.session.query(models.Database).filter_by(id=database_id).one()
+    @expose("/extra_table_metadata/<int:database_id>/<table_name>/<schema>/")
+    @event_logger.log_this
+    def extra_table_metadata(  # pylint: disable=no-self-use
+        self, database_id: int, table_name: str, schema: str
+    ) -> FlaskResponse:
+        parsed_schema = utils.parse_js_uri_path_item(schema, eval_undefined=True)
+        table_name = utils.parse_js_uri_path_item(table_name)  # type: ignore
+        mydb = db.session.query(Database).filter_by(id=database_id).one()
         payload = mydb.db_engine_spec.extra_table_metadata(
-            mydb, table_name, schema)
+            mydb, table_name, parsed_schema
+        )
         return json_success(json.dumps(payload))
 
     @has_access
-    @expose('/select_star/<database_id>/<table_name>/')
-    @log_this
-    def select_star(self, database_id, table_name):
-        mydb = db.session.query(
-            models.Database).filter_by(id=database_id).first()
-        return self.render_template(
-            'superset/ajah.html',
-            content=mydb.select_star(table_name, show_cols=True),
+    @expose("/select_star/<int:database_id>/<table_name>")
+    @expose("/select_star/<int:database_id>/<table_name>/<schema>")
+    @event_logger.log_this
+    def select_star(
+        self, database_id: int, table_name: str, schema: Optional[str] = None
+    ) -> FlaskResponse:
+        logging.warning(
+            "%s.select_star "
+            "This API endpoint is deprecated and will be removed in version 2.0.0",
+            self.__class__.__name__,
+        )
+        stats_logger.incr(f"{self.__class__.__name__}.select_star.init")
+        database = db.session.query(Database).get(database_id)
+        if not database:
+            stats_logger.incr(
+                f"deprecated.{self.__class__.__name__}.select_star.database_not_found"
+            )
+            return json_error_response("Not found", 404)
+        schema = utils.parse_js_uri_path_item(schema, eval_undefined=True)
+        table_name = utils.parse_js_uri_path_item(table_name)  # type: ignore
+        if not self.appbuilder.sm.can_access_table(database, Table(table_name, schema)):
+            stats_logger.incr(
+                f"deprecated.{self.__class__.__name__}.select_star.permission_denied"
+            )
+            logging.warning(
+                "Permission denied for user %s on table: %s schema: %s",
+                str(g.user),
+                table_name,
+                schema,
+            )
+            return json_error_response("Not found", 404)
+        stats_logger.incr(f"deprecated.{self.__class__.__name__}.select_star.success")
+        return json_success(
+            database.select_star(
+                table_name, schema, latest_partition=True, show_cols=True
+            )
         )
 
-    @expose('/theme/')
-    def theme(self):
-        return self.render_template('superset/theme.html')
+    @has_access_api
+    @expose("/estimate_query_cost/<int:database_id>/", methods=["POST"])
+    @expose("/estimate_query_cost/<int:database_id>/<schema>/", methods=["POST"])
+    @event_logger.log_this
+    def estimate_query_cost(  # pylint: disable=no-self-use
+        self, database_id: int, schema: Optional[str] = None
+    ) -> FlaskResponse:
+        mydb = db.session.query(Database).get(database_id)
+
+        sql = json.loads(request.form.get("sql", '""'))
+        template_params = json.loads(request.form.get("templateParams") or "{}")
+        if template_params:
+            template_processor = get_template_processor(mydb)
+            sql = template_processor.process_template(sql, **template_params)
+
+        timeout = SQLLAB_QUERY_COST_ESTIMATE_TIMEOUT
+        timeout_msg = f"The estimation exceeded the {timeout} seconds timeout."
+        try:
+            with utils.timeout(seconds=timeout, error_message=timeout_msg):
+                cost = mydb.db_engine_spec.estimate_query_cost(
+                    mydb, schema, sql, utils.QuerySource.SQL_LAB
+                )
+        except SupersetTimeoutException as ex:
+            logger.exception(ex)
+            return json_errors_response([ex.error])
+        except Exception as ex:  # pylint: disable=broad-except
+            return json_error_response(utils.error_msg_from_exception(ex))
+
+        spec = mydb.db_engine_spec
+        query_cost_formatters: Dict[str, Any] = get_feature_flags().get(
+            "QUERY_COST_FORMATTERS_BY_ENGINE", {}
+        )
+        query_cost_formatter = query_cost_formatters.get(
+            spec.engine, spec.query_cost_formatter
+        )
+        cost = query_cost_formatter(cost)
+
+        return json_success(json.dumps(cost))
+
+    @expose("/theme/")
+    def theme(self) -> FlaskResponse:
+        return self.render_template("superset/theme.html")
 
     @has_access_api
-    @expose('/cached_key/<key>/')
-    @log_this
-    def cached_key(self, key):
-        """Returns a key from the cache"""
-        resp = cache.get(key)
-        if resp:
-            return resp
-        return 'nope'
+    @expose("/results/<key>/")
+    @event_logger.log_this
+    def results(self, key: str) -> FlaskResponse:
+        return self.results_exec(key)
 
-    @has_access_api
-    @expose('/cache_key_exist/<key>/')
-    @log_this
-    def cache_key_exist(self, key):
-        """Returns if a key from cache exist"""
-        key_exist = True if cache.get(key) else False
-        status = 200 if key_exist else 404
-        return json_success(json.dumps({'key_exist': key_exist}),
-                            status=status)
+    @staticmethod
+    def results_exec(  # pylint: disable=too-many-return-statements
+        key: str,
+    ) -> FlaskResponse:
+        """Serves a key off of the results backend
 
-    @has_access_api
-    @expose('/results/<key>/')
-    @log_this
-    def results(self, key):
-        """Serves a key off of the results backend"""
+        It is possible to pass the `rows` query argument to limit the number
+        of rows returned.
+        """
         if not results_backend:
             return json_error_response("Results backend isn't configured")
 
+        read_from_results_backend_start = now_as_float()
         blob = results_backend.get(key)
+        stats_logger.timing(
+            "sqllab.query.results_backend_read",
+            now_as_float() - read_from_results_backend_start,
+        )
         if not blob:
             return json_error_response(
-                'Data could not be retrieved. '
-                'You may want to re-run the query.',
+                "Data could not be retrieved. " "You may want to re-run the query.",
                 status=410,
             )
 
-        query = db.session.query(Query).filter_by(results_key=key).one()
-        rejected_tables = security_manager.rejected_datasources(
-            query.sql, query.database, query.schema)
-        if rejected_tables:
-            return json_error_response(get_datasource_access_error_msg(
-                '{}'.format(rejected_tables)))
-
-        payload = utils.zlib_decompress_to_string(blob)
-        display_limit = app.config.get('DISPLAY_SQL_MAX_ROW', None)
-        if display_limit:
-            payload_json = json.loads(payload)
-            payload_json['data'] = payload_json['data'][:display_limit]
-        return json_success(
-            json.dumps(
-                payload_json, default=utils.json_iso_dttm_ser, ignore_nan=True))
-
-    @has_access_api
-    @expose('/stop_query/', methods=['POST'])
-    @log_this
-    def stop_query(self):
-        client_id = request.form.get('client_id')
-        try:
-            query = (
-                db.session.query(Query)
-                .filter_by(client_id=client_id).one()
+        query = db.session.query(Query).filter_by(results_key=key).one_or_none()
+        if query is None:
+            return json_error_response(
+                "Data could not be retrieved. You may want to re-run the query.",
+                status=404,
             )
-            query.status = utils.QueryStatus.STOPPED
-            db.session.commit()
-        except Exception:
-            pass
-        return self.json_response('OK')
+
+        try:
+            query.raise_for_access()
+        except SupersetSecurityException as ex:
+            return json_errors_response([ex.error], status=403)
+
+        payload = utils.zlib_decompress(blob, decode=not results_backend_use_msgpack)
+        try:
+            obj = _deserialize_results_payload(
+                payload, query, cast(bool, results_backend_use_msgpack)
+            )
+        except SerializationError:
+            return json_error_response(
+                __("Data could not be deserialized. You may want to re-run the query."),
+                status=404,
+            )
+
+        if "rows" in request.args:
+            try:
+                rows = int(request.args["rows"])
+            except ValueError:
+                return json_error_response("Invalid `rows` argument", status=400)
+            obj = apply_display_max_row_limit(obj, rows)
+
+        return json_success(
+            json.dumps(obj, default=utils.json_iso_dttm_ser, ignore_nan=True)
+        )
 
     @has_access_api
-    @expose('/sql_json/', methods=['POST', 'GET'])
-    @log_this
-    def sql_json(self):
-        """Runs arbitrary sql and returns and json"""
-        async = request.form.get('runAsync') == 'true'
-        sql = request.form.get('sql')
-        database_id = request.form.get('database_id')
-        schema = request.form.get('schema') or None
-        template_params = json.loads(
-            request.form.get('templateParams') or '{}')
+    @expose("/stop_query/", methods=["POST"])
+    @event_logger.log_this
+    @backoff.on_exception(
+        backoff.constant,
+        Exception,
+        interval=1,
+        on_backoff=lambda details: db.session.rollback(),
+        on_giveup=lambda details: db.session.rollback(),
+        max_tries=5,
+    )
+    def stop_query(self) -> FlaskResponse:
+        client_id = request.form.get("client_id")
+
+        query = db.session.query(Query).filter_by(client_id=client_id).one()
+        if query.status in [
+            QueryStatus.FAILED,
+            QueryStatus.SUCCESS,
+            QueryStatus.TIMED_OUT,
+        ]:
+            logger.error(
+                "Query with client_id %s could not be stopped: "
+                "query already complete",
+                str(client_id),
+            )
+            return self.json_response("OK")
+        query.status = QueryStatus.STOPPED
+        db.session.commit()
+
+        return self.json_response("OK")
+
+    @has_access_api
+    @event_logger.log_this
+    @expose("/validate_sql_json/", methods=["POST", "GET"])
+    def validate_sql_json(
+        # pylint: disable=too-many-locals,too-many-return-statements,no-self-use
+        self,
+    ) -> FlaskResponse:
+        """Validates that arbitrary sql is acceptable for the given database.
+        Returns a list of error/warning annotations as json.
+        """
+        sql = request.form["sql"]
+        database_id = request.form["database_id"]
+        schema = request.form.get("schema") or None
+        template_params = json.loads(request.form.get("templateParams") or "{}")
+
+        if len(template_params) > 0:
+            # TODO: factor the Database object out of template rendering
+            #       or provide it as mydb so we can render template params
+            #       without having to also persist a Query ORM object.
+            return json_error_response(
+                "SQL validation does not support template parameters", status=400
+            )
 
         session = db.session()
-        mydb = session.query(models.Database).filter_by(id=database_id).first()
-
+        mydb = session.query(Database).filter_by(id=database_id).one_or_none()
         if not mydb:
-            json_error_response(
-                'Database with id {} is missing.'.format(database_id))
-
-        rejected_tables = security_manager.rejected_datasources(sql, mydb, schema)
-        if rejected_tables:
-            return json_error_response(get_datasource_access_error_msg(
-                '{}'.format(rejected_tables)))
-        session.commit()
-
-        select_as_cta = request.form.get('select_as_cta') == 'true'
-        tmp_table_name = request.form.get('tmp_table_name')
-        if select_as_cta and mydb.force_ctas_schema:
-            tmp_table_name = '{}.{}'.format(
-                mydb.force_ctas_schema,
-                tmp_table_name,
+            return json_error_response(
+                "Database with id {} is missing.".format(database_id), status=400
             )
 
-        query = Query(
-            database_id=int(database_id),
-            limit=mydb.db_engine_spec.get_limit_from_sql(sql),
-            sql=sql,
-            schema=schema,
-            select_as_cta=request.form.get('select_as_cta') == 'true',
-            start_time=utils.now_as_float(),
-            tab_name=request.form.get('tab'),
-            status=QueryStatus.PENDING if async else QueryStatus.RUNNING,
-            sql_editor_id=request.form.get('sql_editor_id'),
-            tmp_table_name=tmp_table_name,
-            user_id=int(g.user.get_id()),
-            client_id=request.form.get('client_id'),
-        )
-        session.add(query)
-        session.flush()
-        query_id = query.id
-        session.commit()  # shouldn't be necessary
-        if not query_id:
-            raise Exception(_('Query record was not created as expected.'))
-        logging.info('Triggering query_id: {}'.format(query_id))
-
-        try:
-            template_processor = get_template_processor(
-                database=query.database, query=query)
-            rendered_query = template_processor.process_template(
-                query.sql,
-                **template_params)
-        except Exception as e:
+        spec = mydb.db_engine_spec
+        validators_by_engine = get_feature_flags().get("SQL_VALIDATORS_BY_ENGINE")
+        if not validators_by_engine or spec.engine not in validators_by_engine:
             return json_error_response(
-                'Template rendering failed: {}'.format(utils.error_msg_from_exception(e)))
-
-        # Async request.
-        if async:
-            logging.info('Running query on a Celery worker')
-            # Ignore the celery future object and the request may time out.
-            try:
-                sql_lab.get_sql_results.delay(
-                    query_id,
-                    rendered_query,
-                    return_results=False,
-                    store_results=not query.select_as_cta,
-                    user_name=g.user.username)
-            except Exception as e:
-                logging.exception(e)
-                msg = (
-                    'Failed to start remote query on a worker. '
-                    'Tell your administrator to verify the availability of '
-                    'the message queue.'
+                "no SQL validator is configured for {}".format(spec.engine), status=400
+            )
+        validator_name = validators_by_engine[spec.engine]
+        validator = get_validator_by_name(validator_name)
+        if not validator:
+            return json_error_response(
+                "No validator named {} found (configured for the {} engine)".format(
+                    validator_name, spec.engine
                 )
-                query.status = QueryStatus.FAILED
-                query.error_message = msg
-                session.commit()
-                return json_error_response('{}'.format(msg))
+            )
 
-            resp = json_success(json.dumps(
-                {'query': query.to_dict()}, default=utils.json_int_dttm_ser,
-                ignore_nan=True), status=202)
-            session.commit()
-            return resp
-
-        # Sync request.
         try:
-            timeout = config.get('SQLLAB_TIMEOUT')
-            timeout_msg = (
-                'The query exceeded the {timeout} seconds '
-                'timeout.').format(**locals())
-            with utils.timeout(seconds=timeout,
-                               error_message=timeout_msg):
-                # pylint: disable=no-value-for-parameter
-                data = sql_lab.get_sql_results(
-                    query_id,
-                    rendered_query,
-                    return_results=True)
+            timeout = config["SQLLAB_VALIDATION_TIMEOUT"]
+            timeout_msg = f"The query exceeded the {timeout} seconds timeout."
+            with utils.timeout(seconds=timeout, error_message=timeout_msg):
+                errors = validator.validate(sql, schema, mydb)
             payload = json.dumps(
-                data,
+                [err.to_dict() for err in errors],
                 default=utils.pessimistic_json_iso_dttm_ser,
                 ignore_nan=True,
                 encoding=None,
             )
-        except Exception as e:
-            logging.exception(e)
-            return json_error_response('{}'.format(e))
-        if data.get('status') == QueryStatus.FAILED:
-            return json_error_response(payload=data)
+            return json_success(payload)
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception(ex)
+            msg = _(
+                "%(validator)s was unable to check your query.\n"
+                "Please recheck your query.\n"
+                "Exception: %(ex)s",
+                validator=validator.name,
+                ex=ex,
+            )
+            # Return as a 400 if the database error message says we got a 4xx error
+            if re.search(r"([\W]|^)4\d{2}([\W]|$)", str(ex)):
+                return json_error_response(f"{msg}", status=400)
+            return json_error_response(f"{msg}")
+
+    @staticmethod
+    def _sql_json_async(  # pylint: disable=too-many-arguments
+        session: Session,
+        rendered_query: str,
+        query: Query,
+        expand_data: bool,
+        log_params: Optional[Dict[str, Any]] = None,
+    ) -> FlaskResponse:
+        """
+        Send SQL JSON query to celery workers.
+
+        :param session: SQLAlchemy session object
+        :param rendered_query: the rendered query to perform by workers
+        :param query: The query (SQLAlchemy) object
+        :return: A Flask Response
+        """
+        logger.info("Query %i: Running query on a Celery worker", query.id)
+        # Ignore the celery future object and the request may time out.
+        query_id = query.id
+        try:
+            task = sql_lab.get_sql_results.delay(
+                query.id,
+                rendered_query,
+                return_results=False,
+                store_results=not query.select_as_cta,
+                user_name=g.user.username if g.user else None,
+                start_time=now_as_float(),
+                expand_data=expand_data,
+                log_params=log_params,
+            )
+
+            # Explicitly forget the task to ensure the task metadata is removed from the
+            # Celery results backend in a timely manner.
+            try:
+                task.forget()
+            except NotImplementedError:
+                logger.warning(
+                    "Unable to forget Celery task as backend"
+                    "does not support this operation"
+                )
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception("Query %i: %s", query.id, str(ex))
+            msg = _(
+                "Failed to start remote query on a worker. "
+                "Tell your administrator to verify the availability of "
+                "the message queue."
+            )
+            query.status = QueryStatus.FAILED
+            query.error_message = msg
+            session.commit()
+            return json_error_response("{}".format(msg))
+
+        # Update saved query with execution info from the query execution
+        QueryDAO.update_saved_query_exec_info(query_id)
+
+        resp = json_success(
+            json.dumps(
+                {"query": query.to_dict()},
+                default=utils.json_int_dttm_ser,
+                ignore_nan=True,
+            ),
+            status=202,
+        )
+        session.commit()
+        return resp
+
+    @staticmethod
+    def _sql_json_sync(
+        _session: Session,
+        rendered_query: str,
+        query: Query,
+        expand_data: bool,
+        log_params: Optional[Dict[str, Any]] = None,
+    ) -> FlaskResponse:
+        """
+        Execute SQL query (sql json).
+
+        :param rendered_query: The rendered query (included templates)
+        :param query: The query SQL (SQLAlchemy) object
+        :return: A Flask Response
+        :raises: SupersetTimeoutException
+        """
+        try:
+            timeout = config["SQLLAB_TIMEOUT"]
+            timeout_msg = f"The query exceeded the {timeout} seconds timeout."
+            store_results = (
+                is_feature_enabled("SQLLAB_BACKEND_PERSISTENCE")
+                and not query.select_as_cta
+            )
+            query_id = query.id
+            with utils.timeout(seconds=timeout, error_message=timeout_msg):
+                # pylint: disable=no-value-for-parameter
+                data = sql_lab.get_sql_results(
+                    query.id,
+                    rendered_query,
+                    return_results=True,
+                    store_results=store_results,
+                    user_name=g.user.username if g.user else None,
+                    expand_data=expand_data,
+                    log_params=log_params,
+                )
+
+            # Update saved query if needed
+            QueryDAO.update_saved_query_exec_info(query_id)
+
+            payload = json.dumps(
+                apply_display_max_row_limit(data),
+                default=utils.pessimistic_json_iso_dttm_ser,
+                ignore_nan=True,
+                encoding=None,
+            )
+        except SupersetTimeoutException as ex:
+            # re-raise exception for api exception handler
+            raise ex
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception("Query %i failed unexpectedly", query.id)
+            raise SupersetGenericDBErrorException(utils.error_msg_from_exception(ex))
+
+        if data.get("status") == QueryStatus.FAILED:
+            raise SupersetGenericDBErrorException(data["error"])
         return json_success(payload)
 
-    @has_access
-    @expose('/csv/<client_id>')
-    @log_this
-    def csv(self, client_id):
-        """Download the query results as csv."""
-        logging.info('Exporting CSV file [{}]'.format(client_id))
-        query = (
-            db.session.query(Query)
-            .filter_by(client_id=client_id)
-            .one()
+    @has_access_api
+    @handle_api_exception
+    @event_logger.log_this
+    @expose("/sql_json/", methods=["POST"])
+    def sql_json(self) -> FlaskResponse:
+        log_params = {
+            "user_agent": cast(Optional[str], request.headers.get("USER_AGENT"))
+        }
+        return self.sql_json_exec(request.json, log_params)
+
+    def sql_json_exec(  # pylint: disable=too-many-statements,too-many-locals
+        self, query_params: Dict[str, Any], log_params: Optional[Dict[str, Any]] = None
+    ) -> FlaskResponse:
+        """Runs arbitrary sql and returns data as json"""
+        # Collect Values
+        database_id: int = cast(int, query_params.get("database_id"))
+        schema: str = cast(str, query_params.get("schema"))
+        sql: str = cast(str, query_params.get("sql"))
+        try:
+            template_params = json.loads(query_params.get("templateParams") or "{}")
+        except json.JSONDecodeError:
+            logger.warning(
+                "Invalid template parameter %s" " specified. Defaulting to empty dict",
+                str(query_params.get("templateParams")),
+            )
+            template_params = {}
+        limit: int = query_params.get("queryLimit") or app.config["SQL_MAX_ROW"]
+        async_flag: bool = cast(bool, query_params.get("runAsync"))
+        if limit < 0:
+            logger.warning(
+                "Invalid limit of %i specified. Defaulting to max limit.", limit
+            )
+            limit = 0
+        select_as_cta: bool = cast(bool, query_params.get("select_as_cta"))
+        ctas_method: CtasMethod = cast(
+            CtasMethod, query_params.get("ctas_method", CtasMethod.TABLE)
+        )
+        tmp_table_name: str = cast(str, query_params.get("tmp_table_name"))
+        client_id: str = cast(
+            str, query_params.get("client_id") or utils.shortid()[:10]
+        )
+        sql_editor_id: str = cast(str, query_params.get("sql_editor_id"))
+        tab_name: str = cast(str, query_params.get("tab"))
+        status: str = QueryStatus.PENDING if async_flag else QueryStatus.RUNNING
+
+        session = db.session()
+        mydb = session.query(Database).get(database_id)
+        if not mydb:
+            return json_error_response("Database with id %i is missing.", database_id)
+
+        # Set tmp_schema_name for CTA
+        # TODO(bkyryliuk): consider parsing, splitting tmp_schema_name from
+        #  tmp_table_name if user enters
+        # <schema_name>.<table_name>
+        tmp_schema_name: Optional[str] = schema
+        if select_as_cta and mydb.force_ctas_schema:
+            tmp_schema_name = mydb.force_ctas_schema
+        elif select_as_cta:
+            tmp_schema_name = get_cta_schema_name(mydb, g.user, schema, sql)
+
+        # Save current query
+        query = Query(
+            database_id=database_id,
+            sql=sql,
+            schema=schema,
+            select_as_cta=select_as_cta,
+            ctas_method=ctas_method,
+            start_time=now_as_float(),
+            tab_name=tab_name,
+            status=status,
+            sql_editor_id=sql_editor_id,
+            tmp_table_name=tmp_table_name,
+            tmp_schema_name=tmp_schema_name,
+            user_id=g.user.get_id() if g.user else None,
+            client_id=client_id,
+        )
+        try:
+            session.add(query)
+            session.flush()
+            query_id = query.id
+            session.commit()  # shouldn't be necessary
+        except SQLAlchemyError as ex:
+            logger.error("Errors saving query details %s", str(ex))
+            session.rollback()
+            raise Exception(_("Query record was not created as expected."))
+        if not query_id:
+            raise Exception(_("Query record was not created as expected."))
+
+        logger.info("Triggering query_id: %i", query_id)
+
+        try:
+            query.raise_for_access()
+        except SupersetSecurityException as ex:
+            query.status = QueryStatus.FAILED
+            session.commit()
+            return json_errors_response([ex.error], status=403)
+
+        try:
+            template_processor = get_template_processor(
+                database=query.database, query=query
+            )
+            rendered_query = template_processor.process_template(
+                query.sql, **template_params
+            )
+        except TemplateError as ex:
+            query.status = QueryStatus.FAILED
+            session.commit()
+            raise SupersetTemplateParamsErrorException(
+                utils.error_msg_from_exception(ex)
+            )
+
+        if is_feature_enabled("ENABLE_TEMPLATE_PROCESSING"):
+            # pylint: disable=protected-access
+            ast = template_processor._env.parse(rendered_query)
+            undefined_parameters = find_undeclared_variables(ast)  # type: ignore
+            if undefined_parameters:
+                query.status = QueryStatus.FAILED
+                session.commit()
+                raise SupersetTemplateParamsErrorException(
+                    message=ngettext(
+                        "The parameter %(parameters)s in your query is undefined.",
+                        "The following parameters in your query are undefined: %(parameters)s.",
+                        len(undefined_parameters),
+                        parameters=utils.format_list(undefined_parameters),
+                    )
+                    + " "
+                    + PARAMETER_MISSING_ERR,
+                    extra={
+                        "undefined_parameters": list(undefined_parameters),
+                        "template_parameters": template_params,
+                    },
+                )
+
+        # Limit is not applied to the CTA queries if SQLLAB_CTAS_NO_LIMIT flag is set
+        # to True.
+        if not (config.get("SQLLAB_CTAS_NO_LIMIT") and select_as_cta):
+            # set LIMIT after template processing
+            limits = [mydb.db_engine_spec.get_limit_from_sql(rendered_query), limit]
+            query.limit = min(lim for lim in limits if lim is not None)
+
+        # Flag for whether or not to expand data
+        # (feature that will expand Presto row objects and arrays)
+        expand_data: bool = cast(
+            bool,
+            is_feature_enabled("PRESTO_EXPAND_DATA")
+            and query_params.get("expand_data"),
         )
 
-        rejected_tables = security_manager.rejected_datasources(
-            query.sql, query.database, query.schema)
-        if rejected_tables:
-            flash(get_datasource_access_error_msg('{}'.format(rejected_tables)))
-            return redirect('/')
+        # Async request.
+        if async_flag:
+            return self._sql_json_async(
+                session, rendered_query, query, expand_data, log_params
+            )
+        # Sync request.
+        return self._sql_json_sync(
+            session, rendered_query, query, expand_data, log_params
+        )
+
+    @has_access
+    @event_logger.log_this
+    @expose("/csv/<client_id>")
+    def csv(self, client_id: str) -> FlaskResponse:  # pylint: disable=no-self-use
+        """Download the query results as csv."""
+        logger.info("Exporting CSV file [%s]", client_id)
+        query = db.session.query(Query).filter_by(client_id=client_id).one()
+
+        try:
+            query.raise_for_access()
+        except SupersetSecurityException as ex:
+            flash(ex.error.message)
+            return redirect("/")
+
         blob = None
         if results_backend and query.results_key:
-            logging.info(
-                'Fetching CSV from results backend '
-                '[{}]'.format(query.results_key))
+            logger.info("Fetching CSV from results backend [%s]", query.results_key)
             blob = results_backend.get(query.results_key)
         if blob:
-            logging.info('Decompressing')
-            json_payload = utils.zlib_decompress_to_string(blob)
-            obj = json.loads(json_payload)
-            columns = [c['name'] for c in obj['columns']]
-            df = pd.DataFrame.from_records(obj['data'], columns=columns)
-            logging.info('Using pandas to convert to CSV')
-            csv = df.to_csv(index=False, **config.get('CSV_EXPORT'))
+            logger.info("Decompressing")
+            payload = utils.zlib_decompress(
+                blob, decode=not results_backend_use_msgpack
+            )
+            obj = _deserialize_results_payload(
+                payload, query, cast(bool, results_backend_use_msgpack)
+            )
+            columns = [c["name"] for c in obj["columns"]]
+            df = pd.DataFrame.from_records(obj["data"], columns=columns)
+            logger.info("Using pandas to convert to CSV")
+            csv = df.to_csv(index=False, **config["CSV_EXPORT"])
         else:
-            logging.info('Running a query to turn into CSV')
+            logger.info("Running a query to turn into CSV")
             sql = query.select_sql or query.executed_sql
             df = query.database.get_df(sql, query.schema)
             # TODO(bkyryliuk): add compression=gzip for big files.
-            csv = df.to_csv(index=False, **config.get('CSV_EXPORT'))
-        response = Response(csv, mimetype='text/csv')
-        response.headers['Content-Disposition'] = (
-            'attachment; filename={}.csv'.format(unidecode(query.name)))
-        logging.info('Ready to return response')
+            csv = df.to_csv(index=False, **config["CSV_EXPORT"])
+        response = Response(csv, mimetype="text/csv")
+        quoted_csv_name = parse.quote(query.name)
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="{quoted_csv_name}.csv"; '
+            f"filename*=UTF-8''{quoted_csv_name}.csv"
+        )
+        event_info = {
+            "event_type": "data_export",
+            "client_id": client_id,
+            "row_count": len(df.index),
+            "database": query.database.name,
+            "schema": query.schema,
+            "sql": query.sql,
+            "exported_format": "csv",
+        }
+        event_rep = repr(event_info)
+        logger.info("CSV exported: %s", event_rep, extra={"superset_event": event_info})
         return response
 
+    @api
+    @handle_api_exception
     @has_access
-    @expose('/fetch_datasource_metadata')
-    @log_this
-    def fetch_datasource_metadata(self):
-        datasource_id, datasource_type = (
-            request.args.get('datasourceKey').split('__'))
+    @event_logger.log_this
+    @expose("/fetch_datasource_metadata")
+    def fetch_datasource_metadata(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        """
+        Fetch the datasource metadata.
+
+        :returns: The Flask response
+        :raises SupersetSecurityException: If the user cannot access the resource
+        """
+
+        datasource_id, datasource_type = request.args["datasourceKey"].split("__")
         datasource = ConnectorRegistry.get_datasource(
-            datasource_type, datasource_id, db.session)
+            datasource_type, datasource_id, db.session,
+        )
         # Check if datasource exists
         if not datasource:
             return json_error_response(DATASOURCE_MISSING_ERR)
 
-        # Check permission for datasource
-        if not security_manager.datasource_access(datasource):
-            return json_error_response(DATASOURCE_ACCESS_ERR)
+        datasource.raise_for_access()
         return json_success(json.dumps(datasource.data))
 
-    @expose('/queries/<last_updated_ms>')
-    def queries(self, last_updated_ms):
-        """Get the updated queries."""
-        stats_logger.incr('queries')
+    @has_access_api
+    @event_logger.log_this
+    @expose("/queries/<float:last_updated_ms>")
+    @expose("/queries/<int:last_updated_ms>")
+    def queries(self, last_updated_ms: Union[float, int]) -> FlaskResponse:
+        """
+        Get the updated queries.
+
+        :param last_updated_ms: Unix time (milliseconds)
+        """
+
+        return self.queries_exec(last_updated_ms)
+
+    @staticmethod
+    def queries_exec(last_updated_ms: Union[float, int]) -> FlaskResponse:
+        stats_logger.incr("queries")
         if not g.user.get_id():
             return json_error_response(
-                'Please login to access the queries.', status=403)
-
-        # Unix time, milliseconds.
-        last_updated_ms_int = int(float(last_updated_ms)) if last_updated_ms else 0
+                "Please login to access the queries.", status=403
+            )
 
         # UTC date time, same that is stored in the DB.
-        last_updated_dt = utils.EPOCH + timedelta(seconds=last_updated_ms_int / 1000)
+        last_updated_dt = datetime.utcfromtimestamp(last_updated_ms / 1000)
 
         sql_queries = (
             db.session.query(Query)
             .filter(
-                Query.user_id == g.user.get_id(),
-                Query.changed_on >= last_updated_dt,
+                Query.user_id == g.user.get_id(), Query.changed_on >= last_updated_dt
             )
             .all()
         )
         dict_queries = {q.client_id: q.to_dict() for q in sql_queries}
-
-        now = int(round(time.time() * 1000))
-
-        unfinished_states = [
-            utils.QueryStatus.PENDING,
-            utils.QueryStatus.RUNNING,
-        ]
-
-        queries_to_timeout = [
-            client_id for client_id, query_dict in dict_queries.items()
-            if (
-                query_dict['state'] in unfinished_states and (
-                    now - query_dict['startDttm'] >
-                    config.get('SQLLAB_ASYNC_TIME_LIMIT_SEC') * 1000
-                )
-            )
-        ]
-
-        if queries_to_timeout:
-            update(Query).where(
-                and_(
-                    Query.user_id == g.user.get_id(),
-                    Query.client_id in queries_to_timeout,
-                ),
-            ).values(state=utils.QueryStatus.TIMED_OUT)
-
-            for client_id in queries_to_timeout:
-                dict_queries[client_id]['status'] = utils.QueryStatus.TIMED_OUT
-
-        return json_success(
-            json.dumps(dict_queries, default=utils.json_int_dttm_ser))
+        return json_success(json.dumps(dict_queries, default=utils.json_int_dttm_ser))
 
     @has_access
-    @expose('/search_queries')
-    @log_this
-    def search_queries(self):
-        """Search for queries."""
-        query = db.session.query(Query)
-        search_user_id = request.args.get('user_id')
-        database_id = request.args.get('database_id')
-        search_text = request.args.get('search_text')
-        status = request.args.get('status')
-        # From and To time stamp should be Epoch timestamp in seconds
-        from_time = request.args.get('from')
-        to_time = request.args.get('to')
+    @event_logger.log_this
+    @expose("/search_queries")
+    def search_queries(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        """
+        Search for previously run sqllab queries. Used for Sqllab Query Search
+        page /superset/sqllab#search.
 
+        Custom permission can_only_search_queries_owned restricts queries
+        to only queries run by current user.
+
+        :returns: Response with list of sql query dicts
+        """
+        if security_manager.can_access_all_queries():
+            search_user_id = request.args.get("user_id")
+        elif request.args.get("user_id") is not None:
+            try:
+                search_user_id = int(cast(int, request.args.get("user_id")))
+            except ValueError:
+                return Response(status=400, mimetype="application/json")
+            if search_user_id != g.user.get_user_id():
+                return Response(status=403, mimetype="application/json")
+        else:
+            search_user_id = g.user.get_user_id()
+        database_id = request.args.get("database_id")
+        search_text = request.args.get("search_text")
+        status = request.args.get("status")
+        # From and To time stamp should be Epoch timestamp in seconds
+        from_time = request.args.get("from")
+        to_time = request.args.get("to")
+
+        query = db.session.query(Query)
         if search_user_id:
-            # Filter on db Id
+            # Filter on user_id
             query = query.filter(Query.user_id == search_user_id)
 
         if database_id:
@@ -2753,8 +2752,7 @@ class Superset(BaseSupersetView):
 
         if search_text:
             # Filter on search text
-            query = query \
-                .filter(Query.sql.like('%{}%'.format(search_text)))
+            query = query.filter(Query.sql.like(f"%{search_text}%"))
 
         if from_time:
             query = query.filter(Query.start_time > int(from_time))
@@ -2762,182 +2760,191 @@ class Superset(BaseSupersetView):
         if to_time:
             query = query.filter(Query.start_time < int(to_time))
 
-        query_limit = config.get('QUERY_SEARCH_LIMIT', 1000)
-        sql_queries = (
-            query.order_by(Query.start_time.asc())
-            .limit(query_limit)
-            .all()
-        )
+        query_limit = config["QUERY_SEARCH_LIMIT"]
+        sql_queries = query.order_by(Query.start_time.asc()).limit(query_limit).all()
 
         dict_queries = [q.to_dict() for q in sql_queries]
 
         return Response(
             json.dumps(dict_queries, default=utils.json_int_dttm_ser),
             status=200,
-            mimetype='application/json')
+            mimetype="application/json",
+        )
 
     @app.errorhandler(500)
-    def show_traceback(self):
-        return render_template(
-            'superset/traceback.html',
-            error_msg=get_error_msg(),
-        ), 500
+    def show_traceback(self) -> FlaskResponse:  # pylint: disable=no-self-use
+        return (
+            render_template("superset/traceback.html", error_msg=get_error_msg()),
+            500,
+        )
 
-    @expose('/welcome')
-    def welcome(self):
+    @event_logger.log_this
+    @expose("/welcome/")
+    def welcome(self) -> FlaskResponse:
         """Personalized welcome page"""
         if not g.user or not g.user.get_id():
+            if conf.get("PUBLIC_ROLE_LIKE_GAMMA", False) or conf["PUBLIC_ROLE_LIKE"]:
+                return self.render_template("superset/public_welcome.html")
             return redirect(appbuilder.get_url_for_login)
 
+        welcome_dashboard_id = (
+            db.session.query(UserAttribute.welcome_dashboard_id)
+            .filter_by(user_id=g.user.get_id())
+            .scalar()
+        )
+        if welcome_dashboard_id:
+            return self.dashboard(str(welcome_dashboard_id))
+
         payload = {
-            'user': bootstrap_user_data(),
-            'common': self.common_bootsrap_payload(),
+            "user": bootstrap_user_data(g.user),
+            "common": common_bootstrap_payload(),
         }
 
         return self.render_template(
-            'superset/basic.html',
-            entry='welcome',
-            title='Superset',
-            bootstrap_data=json.dumps(payload, default=utils.json_iso_dttm_ser),
+            "superset/crud_views.html",
+            entry="crudViews",
+            bootstrap_data=json.dumps(
+                payload, default=utils.pessimistic_json_iso_dttm_ser
+            ),
         )
 
     @has_access
-    @expose('/profile/<username>/')
-    def profile(self, username):
+    @event_logger.log_this
+    @expose("/profile/<username>/")
+    def profile(self, username: str) -> FlaskResponse:
         """User profile page"""
-        if not username and g.user:
-            username = g.user.username
+        user = (
+            db.session.query(ab_models.User).filter_by(username=username).one_or_none()
+        )
+        if not user:
+            abort(404, description=f"User: {username} does not exist.")
 
         payload = {
-            'user': bootstrap_user_data(username, include_perms=True),
-            'common': self.common_bootsrap_payload(),
+            "user": bootstrap_user_data(user, include_perms=True),
+            "common": common_bootstrap_payload(),
         }
 
         return self.render_template(
-            'superset/basic.html',
-            title=username + "'s profile",
-            entry='profile',
-            bootstrap_data=json.dumps(payload, default=utils.json_iso_dttm_ser),
+            "superset/basic.html",
+            title=_("%(user)s's profile", user=username),
+            entry="profile",
+            bootstrap_data=json.dumps(
+                payload, default=utils.pessimistic_json_iso_dttm_ser
+            ),
+        )
+
+    @staticmethod
+    def _get_sqllab_tabs(user_id: int) -> Dict[str, Any]:
+        # send list of tab state ids
+        tabs_state = (
+            db.session.query(TabState.id, TabState.label)
+            .filter_by(user_id=user_id)
+            .all()
+        )
+        tab_state_ids = [str(tab_state[0]) for tab_state in tabs_state]
+        # return first active tab, or fallback to another one if no tab is active
+        active_tab = (
+            db.session.query(TabState)
+            .filter_by(user_id=user_id)
+            .order_by(TabState.active.desc())
+            .first()
+        )
+
+        databases: Dict[int, Any] = {
+            database.id: {
+                k: v for k, v in database.to_json().items() if k in DATABASE_KEYS
+            }
+            for database in DatabaseDAO.find_all()
+        }
+        queries: Dict[str, Any] = {}
+
+        # These are unnecessary if sqllab backend persistence is disabled
+        if is_feature_enabled("SQLLAB_BACKEND_PERSISTENCE"):
+            # return all user queries associated with existing SQL editors
+            user_queries = (
+                db.session.query(Query)
+                .filter_by(user_id=user_id)
+                .filter(Query.sql_editor_id.in_(tab_state_ids))
+                .all()
+            )
+            queries = {
+                query.client_id: dict(query.to_dict().items()) for query in user_queries
+            }
+
+        return {
+            "tab_state_ids": tabs_state,
+            "active_tab": active_tab.to_dict() if active_tab else None,
+            "databases": databases,
+            "queries": queries,
+        }
+
+    @has_access
+    @event_logger.log_this
+    @expose("/sqllab/", methods=["GET", "POST"])
+    def sqllab(self) -> FlaskResponse:
+        """SQL Editor"""
+        payload = {
+            "defaultDbId": config["SQLLAB_DEFAULT_DBID"],
+            "common": common_bootstrap_payload(),
+            **self._get_sqllab_tabs(g.user.get_id()),
+        }
+
+        form_data = request.form.get("form_data")
+        if form_data:
+            try:
+                payload["requested_query"] = json.loads(form_data)
+            except json.JSONDecodeError:
+                pass
+
+        payload["user"] = bootstrap_user_data(g.user)
+        bootstrap_data = json.dumps(
+            payload, default=utils.pessimistic_json_iso_dttm_ser
+        )
+
+        return self.render_template(
+            "superset/basic.html", entry="sqllab", bootstrap_data=bootstrap_data
         )
 
     @has_access
-    @expose('/sqllab')
-    def sqllab(self):
-        """SQL Editor"""
-        d = {
-            'defaultDbId': config.get('SQLLAB_DEFAULT_DBID'),
-            'common': self.common_bootsrap_payload(),
-        }
-        return self.render_template(
-            'superset/basic.html',
-            entry='sqllab',
-            bootstrap_data=json.dumps(d, default=utils.json_iso_dttm_ser),
-        )
+    @event_logger.log_this
+    @expose("/sqllab/history/", methods=["GET"])
+    @event_logger.log_this
+    def sqllab_history(self) -> FlaskResponse:
+        if not is_feature_enabled("ENABLE_REACT_CRUD_VIEWS"):
+            return redirect("/superset/sqllab#search", code=307)
+
+        return super().render_app_template()
 
     @api
     @has_access_api
-    @expose('/slice_query/<slice_id>/')
-    def sliceQuery(self, slice_id):
+    @event_logger.log_this
+    @expose("/schemas_access_for_csv_upload")
+    def schemas_access_for_csv_upload(self) -> FlaskResponse:
         """
         This method exposes an API endpoint to
-        get the database query string for this slice
+        get the schema access control settings for csv upload in this database
         """
-        viz_obj = self.get_viz(slice_id)
-        if not security_manager.datasource_access(viz_obj.datasource):
+        if not request.args.get("db_id"):
+            return json_error_response("No database is allowed for your csv upload")
+
+        db_id = int(request.args["db_id"])
+        database = db.session.query(Database).filter_by(id=db_id).one()
+        try:
+            schemas_allowed = database.get_schema_access_for_csv_upload()
+            if security_manager.can_access_database(database):
+                return self.json_response(schemas_allowed)
+            # the list schemas_allowed should not be empty here
+            # and the list schemas_allowed_processed returned from security_manager
+            # should not be empty either,
+            # otherwise the database should have been filtered out
+            # in CsvToDatabaseForm
+            schemas_allowed_processed = security_manager.get_schemas_accessible_by_user(
+                database, schemas_allowed, False
+            )
+            return self.json_response(schemas_allowed_processed)
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception(ex)
             return json_error_response(
-                DATASOURCE_ACCESS_ERR, status=401, link=config.get(
-                    'PERMISSION_INSTRUCTIONS_LINK'))
-        return self.get_query_string_response(viz_obj)
-
-
-appbuilder.add_view_no_menu(Superset)
-
-
-class CssTemplateModelView(SupersetModelView, DeleteMixin):
-    datamodel = SQLAInterface(models.CssTemplate)
-    list_columns = ['template_name']
-    edit_columns = ['template_name', 'css']
-    add_columns = edit_columns
-    label_columns = {
-        'template_name': _('Template Name'),
-    }
-
-
-class CssTemplateAsyncModelView(CssTemplateModelView):
-    list_columns = ['template_name', 'css']
-
-
-appbuilder.add_separator('Sources')
-appbuilder.add_view(
-    CssTemplateModelView,
-    'CSS Templates',
-    label=__('CSS Templates'),
-    icon='fa-css3',
-    category='Manage',
-    category_label=__('Manage'),
-    category_icon='')
-
-
-appbuilder.add_view_no_menu(CssTemplateAsyncModelView)
-
-appbuilder.add_link(
-    'SQL Editor',
-    label=_('SQL Editor'),
-    href='/superset/sqllab',
-    category_icon='fa-flask',
-    icon='fa-flask',
-    category='SQL Lab',
-    category_label=__('SQL Lab'),
-)
-
-appbuilder.add_link(
-    'Query Search',
-    label=_('Query Search'),
-    href='/superset/sqllab#search',
-    icon='fa-search',
-    category_icon='fa-flask',
-    category='SQL Lab',
-    category_label=__('SQL Lab'),
-)
-
-appbuilder.add_link(
-    'Upload a CSV',
-    label=__('Upload a CSV'),
-    href='/csvtodatabaseview/form',
-    icon='fa-upload',
-    category='Sources',
-    category_label=__('Sources'),
-    category_icon='fa-wrench')
-appbuilder.add_separator('Sources')
-
-
-@app.after_request
-def apply_caching(response):
-    """Applies the configuration's http headers to all responses"""
-    for k, v in config.get('HTTP_HEADERS').items():
-        response.headers[k] = v
-    return response
-
-
-# ---------------------------------------------------------------------
-# Redirecting URL from previous names
-class RegexConverter(BaseConverter):
-    def __init__(self, url_map, *items):
-        super(RegexConverter, self).__init__(url_map)
-        self.regex = items[0]
-
-
-app.url_map.converters['regex'] = RegexConverter
-
-
-@app.route('/<regex("panoramix\/.*"):url>')
-def panoramix(url):  # noqa
-    return redirect(request.full_path.replace('panoramix', 'superset'))
-
-
-@app.route('/<regex("caravel\/.*"):url>')
-def caravel(url):  # noqa
-    return redirect(request.full_path.replace('caravel', 'superset'))
-
-
-# ---------------------------------------------------------------------
+                "Failed to fetch schemas allowed for csv upload in this database! "
+                "Please contact your Superset Admin!"
+            )

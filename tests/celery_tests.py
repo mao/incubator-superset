@@ -1,299 +1,436 @@
-# -*- coding: utf-8 -*-
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# isort:skip_file
 """Unit tests for Superset Celery worker"""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
+import datetime
 import json
-import os
-import subprocess
+import random
+import string
 import time
-import unittest
+import unittest.mock as mock
+from typing import Optional
+from tests.fixtures.birth_names_dashboard import load_birth_names_dashboard_with_slices
 
-import pandas as pd
-from past.builtins import basestring
+import pytest
 
-from superset import app, cli, dataframe, db, security_manager
+import flask
+from flask import current_app
+
+from tests.base_tests import login
+from tests.conftest import CTAS_SCHEMA_NAME
+from tests.test_app import app
+from superset import db, sql_lab
+from superset.result_set import SupersetResultSet
+from superset.db_engine_specs.base import BaseEngineSpec
+from superset.errors import ErrorLevel, SupersetErrorType
+from superset.extensions import celery_app
 from superset.models.helpers import QueryStatus
 from superset.models.sql_lab import Query
-from superset.sql_parse import SupersetQuery
-from .base_tests import SupersetTestCase
+from superset.sql_parse import ParsedQuery, CtasMethod
+from superset.utils.core import get_example_database, backend
+
+CELERY_SLEEP_TIME = 6
+QUERY = "SELECT name FROM birth_names LIMIT 1"
+TEST_SYNC = "test_sync"
+TEST_ASYNC_LOWER_LIMIT = "test_async_lower_limit"
+TEST_SYNC_CTA = "test_sync_cta"
+TEST_ASYNC_CTA = "test_async_cta"
+TEST_ASYNC_CTA_CONFIG = "test_async_cta_config"
+TMP_TABLES = [
+    TEST_SYNC,
+    TEST_SYNC_CTA,
+    TEST_ASYNC_CTA,
+    TEST_ASYNC_CTA_CONFIG,
+    TEST_ASYNC_LOWER_LIMIT,
+]
 
 
-BASE_DIR = app.config.get('BASE_DIR')
+test_client = app.test_client()
 
 
-class CeleryConfig(object):
-    BROKER_URL = 'sqla+sqlite:///' + app.config.get('SQL_CELERY_DB_FILE_PATH')
-    CELERY_IMPORTS = ('superset.sql_lab', )
-    CELERY_RESULT_BACKEND = (
-        'db+sqlite:///' + app.config.get('SQL_CELERY_RESULTS_DB_FILE_PATH'))
-    CELERY_ANNOTATIONS = {'sql_lab.add': {'rate_limit': '10/s'}}
-    CONCURRENCY = 1
+def get_query_by_id(id: int):
+    db.session.commit()
+    query = db.session.query(Query).filter_by(id=id).first()
+    return query
 
 
-app.config['CELERY_CONFIG'] = CeleryConfig
+@pytest.fixture(autouse=True, scope="module")
+def setup_sqllab():
+    with app.app_context():
+        yield
 
-
-class UtilityFunctionTests(SupersetTestCase):
-
-    # TODO(bkyryliuk): support more cases in CTA function.
-    def test_create_table_as(self):
-        q = SupersetQuery('SELECT * FROM outer_space;')
-
-        self.assertEqual(
-            'CREATE TABLE tmp AS \nSELECT * FROM outer_space',
-            q.as_create_table('tmp'))
-
-        self.assertEqual(
-            'DROP TABLE IF EXISTS tmp;\n'
-            'CREATE TABLE tmp AS \nSELECT * FROM outer_space',
-            q.as_create_table('tmp', overwrite=True))
-
-        # now without a semicolon
-        q = SupersetQuery('SELECT * FROM outer_space')
-        self.assertEqual(
-            'CREATE TABLE tmp AS \nSELECT * FROM outer_space',
-            q.as_create_table('tmp'))
-
-        # now a multi-line query
-        multi_line_query = (
-            'SELECT * FROM planets WHERE\n'
-            "Luke_Father = 'Darth Vader'")
-        q = SupersetQuery(multi_line_query)
-        self.assertEqual(
-            'CREATE TABLE tmp AS \nSELECT * FROM planets WHERE\n'
-            "Luke_Father = 'Darth Vader'",
-            q.as_create_table('tmp'),
-        )
-
-
-class CeleryTestCase(SupersetTestCase):
-    def __init__(self, *args, **kwargs):
-        super(CeleryTestCase, self).__init__(*args, **kwargs)
-        self.client = app.test_client()
-
-    def get_query_by_name(self, sql):
-        session = db.session
-        query = session.query(Query).filter_by(sql=sql).first()
-        session.close()
-        return query
-
-    def get_query_by_id(self, id):
-        session = db.session
-        query = session.query(Query).filter_by(id=id).first()
-        session.close()
-        return query
-
-    @classmethod
-    def setUpClass(cls):
-        try:
-            os.remove(app.config.get('SQL_CELERY_DB_FILE_PATH'))
-        except OSError as e:
-            app.logger.warn(str(e))
-        try:
-            os.remove(app.config.get('SQL_CELERY_RESULTS_DB_FILE_PATH'))
-        except OSError as e:
-            app.logger.warn(str(e))
-
-        security_manager.sync_role_definitions()
-
-        worker_command = BASE_DIR + '/bin/superset worker'
-        subprocess.Popen(
-            worker_command, shell=True, stdout=subprocess.PIPE)
-
-        admin = security_manager.find_user('admin')
-        if not admin:
-            security_manager.add_user(
-                'admin', 'admin', ' user', 'admin@fab.org',
-                security_manager.find_role('Admin'),
-                password='general')
-        cli.load_examples(load_test_data=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        subprocess.call(
-            "ps auxww | grep 'celeryd' | awk '{print $2}' | xargs kill -9",
-            shell=True,
-        )
-        subprocess.call(
-            "ps auxww | grep 'superset worker' | awk '{print $2}' | xargs kill -9",
-            shell=True,
-        )
-
-    def run_sql(self, db_id, sql, client_id, cta='false', tmp_table='tmp',
-                async='false'):
-        self.login()
-        resp = self.client.post(
-            '/superset/sql_json/',
-            data=dict(
-                database_id=db_id,
-                sql=sql,
-                async=async,
-                select_as_cta=cta,
-                tmp_table_name=tmp_table,
-                client_id=client_id,
-            ),
-        )
-        self.logout()
-        return json.loads(resp.data.decode('utf-8'))
-
-    def test_run_sync_query_dont_exist(self):
-        main_db = self.get_main_database(db.session)
-        db_id = main_db.id
-        sql_dont_exist = 'SELECT name FROM table_dont_exist'
-        result1 = self.run_sql(db_id, sql_dont_exist, '1', cta='true')
-        self.assertTrue('error' in result1)
-
-    def test_run_sync_query_cta(self):
-        main_db = self.get_main_database(db.session)
-        db_id = main_db.id
-        eng = main_db.get_sqla_engine()
-        perm_name = 'can_sql_json'
-        sql_where = (
-            "SELECT name FROM ab_permission WHERE name='{}'".format(perm_name))
-        result2 = self.run_sql(
-            db_id, sql_where, '2', tmp_table='tmp_table_2', cta='true')
-        self.assertEqual(QueryStatus.SUCCESS, result2['query']['state'])
-        self.assertEqual([], result2['data'])
-        self.assertEqual([], result2['columns'])
-        query2 = self.get_query_by_id(result2['query']['serverId'])
-
-        # Check the data in the tmp table.
-        df2 = pd.read_sql_query(sql=query2.select_sql, con=eng)
-        data2 = df2.to_dict(orient='records')
-        self.assertEqual([{'name': perm_name}], data2)
-
-    def test_run_sync_query_cta_no_data(self):
-        main_db = self.get_main_database(db.session)
-        db_id = main_db.id
-        sql_empty_result = 'SELECT * FROM ab_user WHERE id=666'
-        result3 = self.run_sql(
-            db_id, sql_empty_result, '3', tmp_table='tmp_table_3', cta='true')
-        self.assertEqual(QueryStatus.SUCCESS, result3['query']['state'])
-        self.assertEqual([], result3['data'])
-        self.assertEqual([], result3['columns'])
-
-        query3 = self.get_query_by_id(result3['query']['serverId'])
-        self.assertEqual(QueryStatus.SUCCESS, query3.status)
-
-    def test_run_async_query(self):
-        main_db = self.get_main_database(db.session)
-        eng = main_db.get_sqla_engine()
-        sql_where = "SELECT name FROM ab_role WHERE name='Admin'"
-        result = self.run_sql(
-            main_db.id, sql_where, '4', async='true', tmp_table='tmp_async_1',
-            cta='true')
-        assert result['query']['state'] in (
-            QueryStatus.PENDING, QueryStatus.RUNNING, QueryStatus.SUCCESS)
-
-        time.sleep(1)
-
-        query = self.get_query_by_id(result['query']['serverId'])
-        df = pd.read_sql_query(query.select_sql, con=eng)
-        self.assertEqual(QueryStatus.SUCCESS, query.status)
-        self.assertEqual([{'name': 'Admin'}], df.to_dict(orient='records'))
-        self.assertEqual(QueryStatus.SUCCESS, query.status)
-        self.assertTrue('FROM tmp_async_1' in query.select_sql)
-        self.assertEqual(
-            'CREATE TABLE tmp_async_1 AS \nSELECT name FROM ab_role '
-            "WHERE name='Admin' LIMIT 666", query.executed_sql)
-        self.assertEqual(sql_where, query.sql)
-        self.assertEqual(0, query.rows)
-        self.assertEqual(666, query.limit)
-        self.assertEqual(False, query.limit_used)
-        self.assertEqual(True, query.select_as_cta)
-        self.assertEqual(True, query.select_as_cta_used)
-
-    def test_run_async_query_with_lower_limit(self):
-        main_db = self.get_main_database(db.session)
-        eng = main_db.get_sqla_engine()
-        sql_where = "SELECT name FROM ab_role WHERE name='Alpha' LIMIT 1"
-        result = self.run_sql(
-            main_db.id, sql_where, '5', async='true', tmp_table='tmp_async_2',
-            cta='true')
-        assert result['query']['state'] in (
-            QueryStatus.PENDING, QueryStatus.RUNNING, QueryStatus.SUCCESS)
-
-        time.sleep(1)
-
-        query = self.get_query_by_id(result['query']['serverId'])
-        df = pd.read_sql_query(query.select_sql, con=eng)
-        self.assertEqual(QueryStatus.SUCCESS, query.status)
-        self.assertEqual([{'name': 'Alpha'}], df.to_dict(orient='records'))
-        self.assertEqual(QueryStatus.SUCCESS, query.status)
-        self.assertTrue('FROM tmp_async_2' in query.select_sql)
-        self.assertEqual(
-            'CREATE TABLE tmp_async_2 AS \nSELECT name FROM ab_role '
-            "WHERE name='Alpha' LIMIT 1", query.executed_sql)
-        self.assertEqual(sql_where, query.sql)
-        self.assertEqual(0, query.rows)
-        self.assertEqual(1, query.limit)
-        self.assertEqual(True, query.select_as_cta)
-        self.assertEqual(True, query.select_as_cta_used)
-
-    @staticmethod
-    def de_unicode_dict(d):
-        def str_if_basestring(o):
-            if isinstance(o, basestring):
-                return str(o)
-            return o
-        return {str_if_basestring(k): str_if_basestring(d[k]) for k in d}
-
-    @classmethod
-    def dictify_list_of_dicts(cls, l, k):
-        return {str(o[k]): cls.de_unicode_dict(o) for o in l}
-
-    def test_get_columns(self):
-        main_db = self.get_main_database(db.session)
-        df = main_db.get_df('SELECT * FROM multiformat_time_series', None)
-        cdf = dataframe.SupersetDataFrame(df)
-
-        # Making ordering non-deterministic
-        cols = self.dictify_list_of_dicts(cdf.columns, 'name')
-
-        if main_db.sqlalchemy_uri.startswith('sqlite'):
-            self.assertEqual(self.dictify_list_of_dicts([
-                {'is_date': True, 'type': 'STRING', 'name': 'ds',
-                    'is_dim': False},
-                {'is_date': True, 'type': 'STRING', 'name': 'ds2',
-                    'is_dim': False},
-                {'agg': 'sum', 'is_date': False, 'type': 'INT',
-                    'name': 'epoch_ms', 'is_dim': False},
-                {'agg': 'sum', 'is_date': False, 'type': 'INT',
-                    'name': 'epoch_s', 'is_dim': False},
-                {'is_date': True, 'type': 'STRING', 'name': 'string0',
-                    'is_dim': False},
-                {'is_date': False, 'type': 'STRING',
-                    'name': 'string1', 'is_dim': True},
-                {'is_date': True, 'type': 'STRING', 'name': 'string2',
-                    'is_dim': False},
-                {'is_date': False, 'type': 'STRING',
-                    'name': 'string3', 'is_dim': True}], 'name'),
-                cols,
+        db.session.query(Query).delete()
+        db.session.commit()
+        for tbl in TMP_TABLES:
+            drop_table_if_exists(f"{tbl}_{CtasMethod.TABLE.lower()}", CtasMethod.TABLE)
+            drop_table_if_exists(f"{tbl}_{CtasMethod.VIEW.lower()}", CtasMethod.VIEW)
+            drop_table_if_exists(
+                f"{CTAS_SCHEMA_NAME}.{tbl}_{CtasMethod.TABLE.lower()}", CtasMethod.TABLE
             )
-        else:
-            self.assertEqual(self.dictify_list_of_dicts([
-                {'is_date': True, 'type': 'DATETIME', 'name': 'ds',
-                    'is_dim': False},
-                {'is_date': True, 'type': 'DATETIME',
-                    'name': 'ds2', 'is_dim': False},
-                {'agg': 'sum', 'is_date': False, 'type': 'INT',
-                    'name': 'epoch_ms', 'is_dim': False},
-                {'agg': 'sum', 'is_date': False, 'type': 'INT',
-                    'name': 'epoch_s', 'is_dim': False},
-                {'is_date': True, 'type': 'STRING', 'name': 'string0',
-                    'is_dim': False},
-                {'is_date': False, 'type': 'STRING',
-                    'name': 'string1', 'is_dim': True},
-                {'is_date': True, 'type': 'STRING', 'name': 'string2',
-                    'is_dim': False},
-                {'is_date': False, 'type': 'STRING',
-                    'name': 'string3', 'is_dim': True}], 'name'),
-                cols,
+            drop_table_if_exists(
+                f"{CTAS_SCHEMA_NAME}.{tbl}_{CtasMethod.VIEW.lower()}", CtasMethod.VIEW
             )
 
 
-if __name__ == '__main__':
-    unittest.main()
+def run_sql(
+    sql, cta=False, ctas_method=CtasMethod.TABLE, tmp_table="tmp", async_=False
+):
+    login(test_client, username="admin")
+    db_id = get_example_database().id
+    resp = test_client.post(
+        "/superset/sql_json/",
+        json=dict(
+            database_id=db_id,
+            sql=sql,
+            runAsync=async_,
+            select_as_cta=cta,
+            tmp_table_name=tmp_table,
+            client_id="".join(random.choice(string.ascii_lowercase) for i in range(5)),
+            ctas_method=ctas_method,
+        ),
+    )
+    test_client.get("/logout/", follow_redirects=True)
+    return json.loads(resp.data)
+
+
+def drop_table_if_exists(table_name: str, table_type: CtasMethod) -> None:
+    """Drop table if it exists, works on any DB"""
+    sql = f"DROP {table_type} IF EXISTS  {table_name}"
+    get_example_database().get_sqla_engine().execute(sql)
+
+
+def quote_f(value: Optional[str]):
+    if not value:
+        return value
+    return get_example_database().inspector.engine.dialect.identifier_preparer.quote_identifier(
+        value
+    )
+
+
+def cta_result(ctas_method: CtasMethod):
+    if backend() != "presto":
+        return [], []
+    if ctas_method == CtasMethod.TABLE:
+        return [{"rows": 1}], [{"name": "rows", "type": "BIGINT", "is_date": False}]
+    return [{"result": True}], [{"name": "result", "type": "BOOLEAN", "is_date": False}]
+
+
+# TODO(bkyryliuk): quote table and schema names for all databases
+def get_select_star(table: str, schema: Optional[str] = None):
+    if backend() in {"presto", "hive"}:
+        schema = quote_f(schema)
+        table = quote_f(table)
+    if schema:
+        return f"SELECT *\nFROM {schema}.{table}"
+    return f"SELECT *\nFROM {table}"
+
+
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+def test_run_sync_query_dont_exist(setup_sqllab, ctas_method):
+    sql_dont_exist = "SELECT name FROM table_dont_exist"
+    result = run_sql(sql_dont_exist, cta=True, ctas_method=ctas_method)
+    if backend() == "sqlite" and ctas_method == CtasMethod.VIEW:
+        assert QueryStatus.SUCCESS == result["status"], result
+    else:
+        assert (
+            result["errors"][0]["error_type"]
+            == SupersetErrorType.GENERIC_DB_ENGINE_ERROR
+        )
+        assert result["errors"][0]["level"] == ErrorLevel.ERROR
+        assert result["errors"][0]["extra"] == {
+            "issue_codes": [
+                {
+                    "code": 1002,
+                    "message": "Issue 1002 - The database returned an unexpected error.",
+                }
+            ]
+        }
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+def test_run_sync_query_cta(setup_sqllab, ctas_method):
+    tmp_table_name = f"{TEST_SYNC}_{ctas_method.lower()}"
+    result = run_sql(QUERY, tmp_table=tmp_table_name, cta=True, ctas_method=ctas_method)
+    assert QueryStatus.SUCCESS == result["query"]["state"], result
+    assert cta_result(ctas_method) == (result["data"], result["columns"])
+
+    # Check the data in the tmp table.
+    select_query = get_query_by_id(result["query"]["serverId"])
+    results = run_sql(select_query.select_sql)
+    assert QueryStatus.SUCCESS == results["status"], results
+    assert len(results["data"]) > 0
+
+    delete_tmp_view_or_table(tmp_table_name, ctas_method)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+def test_run_sync_query_cta_no_data(setup_sqllab):
+    sql_empty_result = "SELECT * FROM birth_names WHERE name='random'"
+    result = run_sql(sql_empty_result)
+    assert QueryStatus.SUCCESS == result["query"]["state"]
+    assert ([], []) == (result["data"], result["columns"])
+
+    query = get_query_by_id(result["query"]["serverId"])
+    assert QueryStatus.SUCCESS == query.status
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+@mock.patch(
+    "superset.views.core.get_cta_schema_name", lambda d, u, s, sql: CTAS_SCHEMA_NAME
+)
+def test_run_sync_query_cta_config(setup_sqllab, ctas_method):
+    if backend() == "sqlite":
+        # sqlite doesn't support schemas
+        return
+    tmp_table_name = f"{TEST_SYNC_CTA}_{ctas_method.lower()}"
+    result = run_sql(QUERY, cta=True, ctas_method=ctas_method, tmp_table=tmp_table_name)
+    assert QueryStatus.SUCCESS == result["query"]["state"], result
+    assert cta_result(ctas_method) == (result["data"], result["columns"])
+
+    query = get_query_by_id(result["query"]["serverId"])
+    assert (
+        f"CREATE {ctas_method} {CTAS_SCHEMA_NAME}.{tmp_table_name} AS \n{QUERY}"
+        == query.executed_sql
+    )
+
+    assert query.select_sql == get_select_star(tmp_table_name, schema=CTAS_SCHEMA_NAME)
+    results = run_sql(query.select_sql)
+    assert QueryStatus.SUCCESS == results["status"], result
+
+    delete_tmp_view_or_table(f"{CTAS_SCHEMA_NAME}.{tmp_table_name}", ctas_method)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+@mock.patch(
+    "superset.views.core.get_cta_schema_name", lambda d, u, s, sql: CTAS_SCHEMA_NAME
+)
+def test_run_async_query_cta_config(setup_sqllab, ctas_method):
+    if backend() == "sqlite":
+        # sqlite doesn't support schemas
+        return
+    tmp_table_name = f"{TEST_ASYNC_CTA_CONFIG}_{ctas_method.lower()}"
+    result = run_sql(
+        QUERY, cta=True, ctas_method=ctas_method, async_=True, tmp_table=tmp_table_name,
+    )
+
+    query = wait_for_success(result)
+
+    assert QueryStatus.SUCCESS == query.status
+    assert get_select_star(tmp_table_name, schema=CTAS_SCHEMA_NAME) == query.select_sql
+    assert (
+        f"CREATE {ctas_method} {CTAS_SCHEMA_NAME}.{tmp_table_name} AS \n{QUERY}"
+        == query.executed_sql
+    )
+
+    delete_tmp_view_or_table(f"{CTAS_SCHEMA_NAME}.{tmp_table_name}", ctas_method)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+def test_run_async_cta_query(setup_sqllab, ctas_method):
+    table_name = f"{TEST_ASYNC_CTA}_{ctas_method.lower()}"
+    result = run_sql(
+        QUERY, cta=True, ctas_method=ctas_method, async_=True, tmp_table=table_name
+    )
+
+    query = wait_for_success(result)
+
+    assert QueryStatus.SUCCESS == query.status
+    assert get_select_star(table_name) in query.select_sql
+
+    assert f"CREATE {ctas_method} {table_name} AS \n{QUERY}" == query.executed_sql
+    assert QUERY == query.sql
+    assert query.rows == (1 if backend() == "presto" else 0)
+    assert query.select_as_cta
+    assert query.select_as_cta_used
+
+    delete_tmp_view_or_table(table_name, ctas_method)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+@pytest.mark.parametrize("ctas_method", [CtasMethod.TABLE, CtasMethod.VIEW])
+def test_run_async_cta_query_with_lower_limit(setup_sqllab, ctas_method):
+    tmp_table = f"{TEST_ASYNC_LOWER_LIMIT}_{ctas_method.lower()}"
+    result = run_sql(
+        QUERY, cta=True, ctas_method=ctas_method, async_=True, tmp_table=tmp_table
+    )
+    query = wait_for_success(result)
+
+    assert QueryStatus.SUCCESS == query.status
+
+    assert get_select_star(tmp_table) == query.select_sql
+    assert f"CREATE {ctas_method} {tmp_table} AS \n{QUERY}" == query.executed_sql
+    assert QUERY == query.sql
+    assert query.rows == (1 if backend() == "presto" else 0)
+    assert query.limit is None
+    assert query.select_as_cta
+    assert query.select_as_cta_used
+
+    delete_tmp_view_or_table(tmp_table, ctas_method)
+
+
+SERIALIZATION_DATA = [("a", 4, 4.0, datetime.datetime(2019, 8, 18, 16, 39, 16, 660000))]
+CURSOR_DESCR = (
+    ("a", "string"),
+    ("b", "int"),
+    ("c", "float"),
+    ("d", "datetime"),
+)
+
+
+def test_default_data_serialization():
+    db_engine_spec = BaseEngineSpec()
+    results = SupersetResultSet(SERIALIZATION_DATA, CURSOR_DESCR, db_engine_spec)
+
+    with mock.patch.object(
+        db_engine_spec, "expand_data", wraps=db_engine_spec.expand_data
+    ) as expand_data:
+        data = sql_lab._serialize_and_expand_data(results, db_engine_spec, False, True)
+        expand_data.assert_called_once()
+    assert isinstance(data[0], list)
+
+
+def test_new_data_serialization():
+    db_engine_spec = BaseEngineSpec()
+    results = SupersetResultSet(SERIALIZATION_DATA, CURSOR_DESCR, db_engine_spec)
+
+    with mock.patch.object(
+        db_engine_spec, "expand_data", wraps=db_engine_spec.expand_data
+    ) as expand_data:
+        data = sql_lab._serialize_and_expand_data(results, db_engine_spec, True)
+        expand_data.assert_not_called()
+    assert isinstance(data[0], bytes)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+def test_default_payload_serialization():
+    use_new_deserialization = False
+    db_engine_spec = BaseEngineSpec()
+    results = SupersetResultSet(SERIALIZATION_DATA, CURSOR_DESCR, db_engine_spec)
+    query = {
+        "database_id": 1,
+        "sql": "SELECT * FROM birth_names LIMIT 100",
+        "status": QueryStatus.PENDING,
+    }
+    (
+        serialized_data,
+        selected_columns,
+        all_columns,
+        expanded_columns,
+    ) = sql_lab._serialize_and_expand_data(
+        results, db_engine_spec, use_new_deserialization
+    )
+    payload = {
+        "query_id": 1,
+        "status": QueryStatus.SUCCESS,
+        "state": QueryStatus.SUCCESS,
+        "data": serialized_data,
+        "columns": all_columns,
+        "selected_columns": selected_columns,
+        "expanded_columns": expanded_columns,
+        "query": query,
+    }
+
+    serialized = sql_lab._serialize_payload(payload, use_new_deserialization)
+    assert isinstance(serialized, str)
+
+
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+def test_msgpack_payload_serialization():
+    use_new_deserialization = True
+    db_engine_spec = BaseEngineSpec()
+    results = SupersetResultSet(SERIALIZATION_DATA, CURSOR_DESCR, db_engine_spec)
+    query = {
+        "database_id": 1,
+        "sql": "SELECT * FROM birth_names LIMIT 100",
+        "status": QueryStatus.PENDING,
+    }
+    (
+        serialized_data,
+        selected_columns,
+        all_columns,
+        expanded_columns,
+    ) = sql_lab._serialize_and_expand_data(
+        results, db_engine_spec, use_new_deserialization
+    )
+    payload = {
+        "query_id": 1,
+        "status": QueryStatus.SUCCESS,
+        "state": QueryStatus.SUCCESS,
+        "data": serialized_data,
+        "columns": all_columns,
+        "selected_columns": selected_columns,
+        "expanded_columns": expanded_columns,
+        "query": query,
+    }
+
+    serialized = sql_lab._serialize_payload(payload, use_new_deserialization)
+    assert isinstance(serialized, bytes)
+
+
+def test_create_table_as():
+    q = ParsedQuery("SELECT * FROM outer_space;")
+
+    assert "CREATE TABLE tmp AS \nSELECT * FROM outer_space" == q.as_create_table("tmp")
+    assert (
+        "DROP TABLE IF EXISTS tmp;\nCREATE TABLE tmp AS \nSELECT * FROM outer_space"
+        == q.as_create_table("tmp", overwrite=True)
+    )
+
+    # now without a semicolon
+    q = ParsedQuery("SELECT * FROM outer_space")
+    assert "CREATE TABLE tmp AS \nSELECT * FROM outer_space" == q.as_create_table("tmp")
+
+    # now a multi-line query
+    multi_line_query = "SELECT * FROM planets WHERE\n" "Luke_Father = 'Darth Vader'"
+    q = ParsedQuery(multi_line_query)
+    assert (
+        "CREATE TABLE tmp AS \nSELECT * FROM planets WHERE\nLuke_Father = 'Darth Vader'"
+        == q.as_create_table("tmp")
+    )
+
+
+def test_in_app_context():
+    @celery_app.task()
+    def my_task():
+        assert current_app
+
+    # Make sure we can call tasks with an app already setup
+    my_task()
+
+    # Make sure the app gets pushed onto the stack properly
+    try:
+        popped_app = flask._app_ctx_stack.pop()
+        my_task()
+    finally:
+        flask._app_ctx_stack.push(popped_app)
+
+
+def delete_tmp_view_or_table(name: str, db_object_type: str):
+    db.get_engine().execute(f"DROP {db_object_type} IF EXISTS {name}")
+
+
+def wait_for_success(result):
+    for _ in range(CELERY_SLEEP_TIME * 2):
+        time.sleep(0.5)
+        query = get_query_by_id(result["query"]["serverId"])
+        if QueryStatus.SUCCESS == query.status:
+            break
+    return query
